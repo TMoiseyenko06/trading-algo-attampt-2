@@ -12,11 +12,15 @@ import os
 import sys
 import time
 import math
+import multiprocessing
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+
+# Prevent fork() deadlock warnings with CUDA + multiprocessing
+multiprocessing.set_start_method("spawn", force=True)
 from sklearn.preprocessing import StandardScaler
 import matplotlib
 

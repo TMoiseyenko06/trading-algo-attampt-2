@@ -12,6 +12,7 @@ import os
 import sys
 import time
 import math
+import argparse
 import multiprocessing
 import numpy as np
 import pandas as pd
@@ -57,6 +58,7 @@ WEIGHT_DECAY = 1e-4
 GRAD_CLIP = 1.0
 BASE_BATCH_SIZE = 64
 DATA_FILE = "nq.dbn"
+CHECKPOINT_FILE = "nq_checkpoint.pt"
 TRADE_THRESHOLD = 2.0  # minimum predicted point move to enter a trade
 NQ_MULTIPLIER = 20.0  # $ per NQ point
 
@@ -647,7 +649,23 @@ def backtest(model, test_loader, device, use_amp, y_mean=0.0, y_std=1.0, history
 # ─────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────
+def parse_args():
+    parser = argparse.ArgumentParser(description="NQ Futures Price Prediction Neural Network")
+    parser.add_argument(
+        "--resume", type=str, default=None, metavar="PATH",
+        help=f"Resume training from a saved checkpoint (default: None). "
+             f"Use --resume {CHECKPOINT_FILE} to load the last saved checkpoint.",
+    )
+    parser.add_argument(
+        "--backtest-only", action="store_true",
+        help="Skip training and only run backtest using saved checkpoint.",
+    )
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
+
     print()
     print("╔══════════════════════════════════════════════════════════════╗")
     print("║        NQ FUTURES PREDICTION — CNN+LSTM NEURAL NETWORK     ║")
@@ -759,6 +777,23 @@ def main():
     total_params = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
+    # Load saved weights if resuming
+    resumed = False
+    if args.resume:
+        if not os.path.exists(args.resume):
+            print(f"\nERROR: Checkpoint not found: {args.resume}")
+            sys.exit(1)
+        checkpoint = torch.load(args.resume, map_location=device, weights_only=False)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        # Use saved normalization stats if available
+        if "y_mean" in checkpoint and "y_std" in checkpoint:
+            y_mean = checkpoint["y_mean"]
+            y_std = checkpoint["y_std"]
+        resumed = True
+        resume_label = f"Resumed from:              {args.resume}"
+    else:
+        resume_label = f"Resumed from:              (none — training from scratch)"
+
     box("MODEL ARCHITECTURE", [
         f"Type:                      CNN + LSTM Hybrid",
         f"Conv layers:               2x Conv1D (64, 128)",
@@ -766,6 +801,7 @@ def main():
         f"FC head:                   128 → 64 → 1",
         f"Total parameters:          {total_params:,}",
         f"Trainable parameters:      {trainable:,}",
+        resume_label,
         "---",
         f"Optimizer:                 AdamW (lr={LEARNING_RATE}, wd={WEIGHT_DECAY})",
         f"Loss:                      MSE",
@@ -775,18 +811,33 @@ def main():
         f"Gradient clipping:         {GRAD_CLIP}",
     ])
 
-    # Train
-    start_time = time.time()
-    model, history = train_model(model, train_loader, val_loader, device, use_amp)
-    elapsed = time.time() - start_time
-    print(f"  Wall time: {elapsed / 60:.1f} minutes")
+    # Train (unless backtest-only mode)
+    history = None
+    if args.backtest_only:
+        if not resumed:
+            print("\nERROR: --backtest-only requires --resume <checkpoint>")
+            sys.exit(1)
+        print("\nSkipping training (--backtest-only mode)")
+    else:
+        start_time = time.time()
+        model, history = train_model(model, train_loader, val_loader, device, use_amp)
+        elapsed = time.time() - start_time
+        print(f"  Wall time: {elapsed / 60:.1f} minutes")
+
+        # Save full checkpoint
+        checkpoint = {
+            "model_state_dict": model.state_dict(),
+            "num_features": num_features,
+            "y_mean": y_mean,
+            "y_std": y_std,
+            "lookback": LOOKBACK,
+            "horizon": HORIZON,
+        }
+        torch.save(checkpoint, CHECKPOINT_FILE)
+        print(f"\nCheckpoint saved to {CHECKPOINT_FILE}")
 
     # Backtest (denormalize predictions back to real NQ points)
     backtest(model, test_loader, device, use_amp, y_mean=y_mean, y_std=y_std, history=history)
-
-    # Save model
-    torch.save(model.state_dict(), "nq_model.pt")
-    print("\nModel saved to nq_model.pt")
 
 
 if __name__ == "__main__":

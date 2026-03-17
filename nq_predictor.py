@@ -18,6 +18,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+from scipy.stats import entropy as scipy_entropy
 
 # Prevent fork() deadlock warnings with CUDA + multiprocessing
 multiprocessing.set_start_method("spawn", force=True)
@@ -26,6 +27,20 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+
+
+def box(title, lines, width=62):
+    """Print a formatted box with title and key-value lines."""
+    print()
+    print("┌" + "─" * width + "┐")
+    print("│" + title.center(width) + "│")
+    print("├" + "─" * width + "┤")
+    for line in lines:
+        if line == "---":
+            print("├" + "─" * width + "┤")
+        else:
+            print("│  " + line.ljust(width - 2) + "│")
+    print("└" + "─" * width + "┘")
 
 # ─────────────────────────────────────────────
 # Configuration
@@ -56,9 +71,6 @@ def setup_device():
         props = torch.cuda.get_device_properties(0)
         gpu_mem_gb = props.total_memory / (1024**3)
         gpu_name = props.name
-        print(f"GPU Detected: {gpu_name}")
-        print(f"GPU Memory:   {gpu_mem_gb:.1f} GB")
-        print(f"CUDA Version: {torch.version.cuda}")
 
         # Auto-scale batch size based on GPU memory
         if gpu_mem_gb >= 24:
@@ -70,14 +82,25 @@ def setup_device():
         else:
             batch_size = 32
 
-        print(f"Auto-scaled batch size: {batch_size}")
         use_amp = True
+        box("SYSTEM", [
+            f"Device:          CUDA ({gpu_name})",
+            f"GPU Memory:      {gpu_mem_gb:.1f} GB",
+            f"CUDA Version:    {torch.version.cuda}",
+            f"PyTorch:         {torch.__version__}",
+            f"Batch Size:      {batch_size}  (auto-scaled)",
+            f"Mixed Precision: Enabled (AMP)",
+        ])
     else:
         device = torch.device("cpu")
         batch_size = BASE_BATCH_SIZE
         use_amp = False
-        print("No GPU detected, using CPU")
-        print(f"Batch size: {batch_size}")
+        box("SYSTEM", [
+            f"Device:          CPU",
+            f"PyTorch:         {torch.__version__}",
+            f"Batch Size:      {batch_size}",
+            f"Mixed Precision: Disabled",
+        ])
 
     return device, batch_size, use_amp
 
@@ -93,7 +116,9 @@ def load_data(filepath):
     store = db.DBNStore.from_file(filepath)
     df = store.to_df()
 
-    print(f"Raw records: {len(df)}")
+    raw_count = len(store.to_df())
+
+    df = store.to_df()
 
     # Databento stores prices as fixed-point integers (1e-9 scale)
     price_cols = ["open", "high", "low", "close"]
@@ -116,9 +141,23 @@ def load_data(filepath):
     df = df[(df["close"] > 0) & (df["volume"] >= 0)]
     df = df.reset_index(drop=True)
 
-    print(f"Clean records: {len(df)}")
-    print(f"Price range: {df['close'].min():.2f} - {df['close'].max():.2f}")
-    print(f"Date range: index 0 to {len(df)-1}")
+    # Data statistics
+    avg_range = (df["high"] - df["low"]).mean()
+    avg_volume = df["volume"].mean()
+    total_days = len(df) / 390  # approx trading minutes per day
+
+    box("DATA LOADED", [
+        f"Source:          {filepath}",
+        f"Raw Records:     {raw_count:,}",
+        f"Clean Records:   {len(df):,}  ({len(df) - raw_count:+,} filtered)",
+        f"Approx Days:     {total_days:,.0f}",
+        "---",
+        f"Price Range:     {df['close'].min():.2f}  →  {df['close'].max():.2f}",
+        f"Avg Bar Range:   {avg_range:.2f} pts",
+        f"Avg Volume:      {avg_volume:,.0f}",
+        f"Open:            {df['open'].iloc[0]:.2f}  →  {df['open'].iloc[-1]:.2f}",
+        f"Close:           {df['close'].iloc[0]:.2f}  →  {df['close'].iloc[-1]:.2f}",
+    ])
 
     return df
 
@@ -273,10 +312,14 @@ def train_model(model, train_loader, val_loader, device, use_amp):
 
     best_val_loss = float("inf")
     best_state = None
+    best_epoch = 0
     patience_counter = 0
+    history = {"train": [], "val": []}
 
-    print(f"\n{'Epoch':>5} | {'Train Loss':>12} | {'Val Loss':>12} | {'LR':>10} | {'Status'}")
-    print("-" * 65)
+    print()
+    print("┌───────┬──────────────┬──────────────┬────────────┬───────────┐")
+    print("│ Epoch │  Train Loss  │   Val Loss   │     LR     │  Status   │")
+    print("├───────┼──────────────┼──────────────┼────────────┼───────────┤")
 
     for epoch in range(1, MAX_EPOCHS + 1):
         # ── Train ──
@@ -315,36 +358,61 @@ def train_model(model, train_loader, val_loader, device, use_amp):
         current_lr = optimizer.param_groups[0]["lr"]
         scheduler.step(avg_val)
 
+        history["train"].append(avg_train)
+        history["val"].append(avg_val)
+
         # ── Early stopping ──
         status = ""
         if avg_val < best_val_loss:
             best_val_loss = avg_val
+            best_epoch = epoch
             best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
             patience_counter = 0
-            status = "* best"
+            status = "★ best"
         else:
             patience_counter += 1
             if patience_counter >= EARLY_STOP_PATIENCE:
-                print(f"{epoch:>5} | {avg_train:>12.4f} | {avg_val:>12.4f} | {current_lr:>10.6f} | early stop")
+                print(f"│  {epoch:>3}  │  {avg_train:>10.4f}  │  {avg_val:>10.4f}  │  {current_lr:>8.6f}  │  STOP     │")
                 break
 
         if epoch % 5 == 0 or epoch == 1 or status:
-            print(f"{epoch:>5} | {avg_train:>12.4f} | {avg_val:>12.4f} | {current_lr:>10.6f} | {status}")
+            print(f"│  {epoch:>3}  │  {avg_train:>10.4f}  │  {avg_val:>10.4f}  │  {current_lr:>8.6f}  │  {status:<7}  │")
+
+    print("└───────┴──────────────┴──────────────┴────────────┴───────────┘")
 
     # Restore best weights
     if best_state is not None:
         model.load_state_dict(best_state)
         model.to(device)
 
-    print(f"\nBest validation loss: {best_val_loss:.4f}")
-    return model
+    # Overfit gap
+    if len(history["train"]) > 0:
+        final_train = history["train"][-1]
+        overfit_ratio = best_val_loss / final_train if final_train > 0 else 0
+        box("TRAINING SUMMARY", [
+            f"Best Epoch:      {best_epoch} / {epoch}",
+            f"Best Val Loss:   {best_val_loss:.4f}",
+            f"Final Train Loss:{final_train:.4f}",
+            f"Overfit Ratio:   {overfit_ratio:.3f}  (val/train, ~1.0 = good)",
+            f"Early Stopped:   {'Yes' if patience_counter >= EARLY_STOP_PATIENCE else 'No'}",
+        ])
+
+    return model, history
 
 
 # ─────────────────────────────────────────────
 # Backtest
 # ─────────────────────────────────────────────
-def backtest(model, test_loader, device, use_amp):
-    """Run predictions on test set and compute metrics."""
+def compute_prediction_entropy(preds, n_bins=50):
+    """Compute Shannon entropy of prediction distribution (higher = more spread)."""
+    hist, _ = np.histogram(preds, bins=n_bins, density=True)
+    hist = hist[hist > 0]  # remove zeros for log
+    hist = hist / hist.sum()  # normalize to probability
+    return scipy_entropy(hist, base=2)
+
+
+def backtest(model, test_loader, device, use_amp, history=None):
+    """Run predictions on test set and compute comprehensive metrics."""
     model.eval()
     all_preds = []
     all_targets = []
@@ -360,78 +428,212 @@ def backtest(model, test_loader, device, use_amp):
     preds = np.concatenate(all_preds)
     targets = np.concatenate(all_targets)
 
-    # ── Metrics ──
-    mae = np.mean(np.abs(preds - targets))
-    rmse = np.sqrt(np.mean((preds - targets) ** 2))
+    # ── Prediction Distribution Stats ──
+    pred_mean = np.mean(preds)
+    pred_std = np.std(preds)
+    pred_min = np.min(preds)
+    pred_max = np.max(preds)
+    pred_median = np.median(preds)
+    pred_entropy = compute_prediction_entropy(preds)
 
-    # Directional accuracy
+    # ── Target Distribution Stats ──
+    tgt_mean = np.mean(targets)
+    tgt_std = np.std(targets)
+    tgt_min = np.min(targets)
+    tgt_max = np.max(targets)
+    tgt_median = np.median(targets)
+    tgt_entropy = compute_prediction_entropy(targets)
+
+    # ── Error Metrics ──
+    errors = preds - targets
+    mae = np.mean(np.abs(errors))
+    rmse = np.sqrt(np.mean(errors**2))
+    mape = np.mean(np.abs(errors) / (np.abs(targets) + 1e-8)) * 100
+    correlation = np.corrcoef(preds, targets)[0, 1]
+    r_squared = 1 - np.sum(errors**2) / np.sum((targets - tgt_mean) ** 2)
+
+    # ── Directional Accuracy ──
     pred_dir = np.sign(preds)
     actual_dir = np.sign(targets)
     dir_accuracy = np.mean(pred_dir == actual_dir) * 100
+    # Breakdown by direction
+    long_mask = pred_dir > 0
+    short_mask = pred_dir < 0
+    long_acc = np.mean(actual_dir[long_mask] > 0) * 100 if long_mask.sum() > 0 else 0
+    short_acc = np.mean(actual_dir[short_mask] < 0) * 100 if short_mask.sum() > 0 else 0
+    long_count = long_mask.sum()
+    short_count = short_mask.sum()
+    flat_count = (pred_dir == 0).sum()
 
     # ── Simulated Trading ──
     equity = [0.0]
-    trades = 0
-    wins = 0
+    trade_pnls = []
+    long_pnls = []
+    short_pnls = []
 
     for i in range(len(preds)):
         if abs(preds[i]) >= TRADE_THRESHOLD:
-            trades += 1
             direction = np.sign(preds[i])
             pnl = direction * targets[i] * NQ_MULTIPLIER
             equity.append(equity[-1] + pnl)
-            if pnl > 0:
-                wins += 1
+            trade_pnls.append(pnl)
+            if direction > 0:
+                long_pnls.append(pnl)
+            else:
+                short_pnls.append(pnl)
         else:
             equity.append(equity[-1])
 
     equity = np.array(equity)
+    trade_pnls = np.array(trade_pnls) if trade_pnls else np.array([0.0])
+    long_pnls = np.array(long_pnls) if long_pnls else np.array([0.0])
+    short_pnls = np.array(short_pnls) if short_pnls else np.array([0.0])
+
+    total_trades = len(trade_pnls)
+    wins = np.sum(trade_pnls > 0)
+    losses = np.sum(trade_pnls < 0)
+    breakeven = np.sum(trade_pnls == 0)
+    win_rate = (wins / total_trades * 100) if total_trades > 0 else 0
     total_pnl = equity[-1]
-    win_rate = (wins / trades * 100) if trades > 0 else 0
+
+    avg_win = np.mean(trade_pnls[trade_pnls > 0]) if wins > 0 else 0
+    avg_loss = np.mean(trade_pnls[trade_pnls < 0]) if losses > 0 else 0
+    largest_win = np.max(trade_pnls) if total_trades > 0 else 0
+    largest_loss = np.min(trade_pnls) if total_trades > 0 else 0
+    profit_factor = abs(np.sum(trade_pnls[trade_pnls > 0]) / np.sum(trade_pnls[trade_pnls < 0])) if losses > 0 and np.sum(trade_pnls[trade_pnls < 0]) != 0 else float("inf")
+    expectancy = np.mean(trade_pnls) if total_trades > 0 else 0
 
     # Max drawdown
     peak = np.maximum.accumulate(equity)
     drawdown = peak - equity
     max_dd = np.max(drawdown)
+    max_dd_pct = (max_dd / np.max(peak) * 100) if np.max(peak) > 0 else 0
+
+    # Sharpe-like ratio (on trade returns)
+    if total_trades > 1 and np.std(trade_pnls) > 0:
+        sharpe = np.mean(trade_pnls) / np.std(trade_pnls) * np.sqrt(252)
+    else:
+        sharpe = 0.0
+
+    # Long/short breakdown
+    long_wins = np.sum(long_pnls > 0)
+    long_total = len(long_pnls)
+    long_wr = (long_wins / long_total * 100) if long_total > 0 else 0
+    long_pnl_total = np.sum(long_pnls)
+
+    short_wins = np.sum(short_pnls > 0)
+    short_total = len(short_pnls)
+    short_wr = (short_wins / short_total * 100) if short_total > 0 else 0
+    short_pnl_total = np.sum(short_pnls)
 
     # ── Print Results ──
-    print("\n" + "=" * 55)
-    print("           BACKTEST RESULTS (Last 20%)")
-    print("=" * 55)
-    print(f"  Test samples:        {len(preds):,}")
-    print(f"  MAE:                 {mae:.2f} points")
-    print(f"  RMSE:                {rmse:.2f} points")
-    print(f"  Directional Acc:     {dir_accuracy:.1f}%")
-    print(f"  ─────────────────────────────────────")
-    print(f"  Trades taken:        {trades:,} (threshold: {TRADE_THRESHOLD} pts)")
-    print(f"  Win rate:            {win_rate:.1f}%")
-    print(f"  Total P&L:           ${total_pnl:,.2f}")
-    print(f"  Max Drawdown:        ${max_dd:,.2f}")
-    print("=" * 55)
+    box("PREDICTION DISTRIBUTION", [
+        f"{'':30} {'Predictions':>14} {'Actual':>14}",
+        f"{'Mean:':30} {pred_mean:>14.4f} {tgt_mean:>14.4f}",
+        f"{'Std Dev:':30} {pred_std:>14.4f} {tgt_std:>14.4f}",
+        f"{'Median:':30} {pred_median:>14.4f} {tgt_median:>14.4f}",
+        f"{'Min:':30} {pred_min:>14.4f} {tgt_min:>14.4f}",
+        f"{'Max:':30} {pred_max:>14.4f} {tgt_max:>14.4f}",
+        f"{'Entropy (bits):':30} {pred_entropy:>14.3f} {tgt_entropy:>14.3f}",
+    ])
+
+    box("MODEL ACCURACY", [
+        f"Test Samples:              {len(preds):,}",
+        f"MAE:                       {mae:.4f} pts",
+        f"RMSE:                      {rmse:.4f} pts",
+        f"MAPE:                      {mape:.2f}%",
+        f"Correlation (r):           {correlation:.4f}",
+        f"R-squared:                 {r_squared:.4f}",
+        "---",
+        f"Directional Accuracy:      {dir_accuracy:.1f}%",
+        f"  Long predictions:        {long_count:,}  (acc: {long_acc:.1f}%)",
+        f"  Short predictions:       {short_count:,}  (acc: {short_acc:.1f}%)",
+        f"  Flat predictions:        {flat_count:,}",
+    ])
+
+    box("TRADING PERFORMANCE", [
+        f"Trade Threshold:           {TRADE_THRESHOLD} pts  |  NQ Multiplier: ${NQ_MULTIPLIER:.0f}/pt",
+        "---",
+        f"Total Trades:              {total_trades:,}",
+        f"  Wins:                    {int(wins):,}",
+        f"  Losses:                  {int(losses):,}",
+        f"  Breakeven:               {int(breakeven):,}",
+        f"Win Rate:                  {win_rate:.1f}%",
+        "---",
+        f"Total P&L:                 ${total_pnl:>12,.2f}",
+        f"Avg Win:                   ${avg_win:>12,.2f}",
+        f"Avg Loss:                  ${avg_loss:>12,.2f}",
+        f"Largest Win:               ${largest_win:>12,.2f}",
+        f"Largest Loss:              ${largest_loss:>12,.2f}",
+        f"Expectancy (per trade):    ${expectancy:>12,.2f}",
+        f"Profit Factor:             {profit_factor:>12.2f}",
+        "---",
+        f"Max Drawdown:              ${max_dd:>12,.2f}  ({max_dd_pct:.1f}%)",
+        f"Annualized Sharpe:         {sharpe:>12.3f}",
+    ])
+
+    box("LONG vs SHORT BREAKDOWN", [
+        f"{'':28} {'Long':>15} {'Short':>15}",
+        f"{'Trades:':28} {long_total:>15,} {short_total:>15,}",
+        f"{'Win Rate:':28} {long_wr:>14.1f}% {short_wr:>14.1f}%",
+        f"{'Total P&L:':28} ${long_pnl_total:>13,.2f} ${short_pnl_total:>13,.2f}",
+    ])
 
     # ── Plots ──
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+    fig.suptitle("NQ Prediction Backtest Results", fontsize=14, fontweight="bold")
 
-    # Equity curve
-    axes[0].plot(equity, linewidth=0.8)
-    axes[0].set_title("Simulated Equity Curve")
-    axes[0].set_xlabel("Trade #")
-    axes[0].set_ylabel("Cumulative P&L ($)")
-    axes[0].axhline(y=0, color="gray", linestyle="--", linewidth=0.5)
-    axes[0].grid(True, alpha=0.3)
+    # 1. Equity curve
+    axes[0, 0].plot(equity, linewidth=0.8, color="#2196F3")
+    axes[0, 0].fill_between(range(len(equity)), equity, 0, alpha=0.1, color="#2196F3")
+    axes[0, 0].set_title("Equity Curve")
+    axes[0, 0].set_xlabel("Bar")
+    axes[0, 0].set_ylabel("Cumulative P&L ($)")
+    axes[0, 0].axhline(y=0, color="gray", linestyle="--", linewidth=0.5)
+    axes[0, 0].grid(True, alpha=0.3)
 
-    # Predicted vs Actual
-    sample_idx = np.random.choice(len(preds), min(2000, len(preds)), replace=False)
-    axes[1].scatter(targets[sample_idx], preds[sample_idx], alpha=0.3, s=5)
+    # 2. Predicted vs Actual scatter
+    sample_n = min(3000, len(preds))
+    sample_idx = np.random.choice(len(preds), sample_n, replace=False)
+    axes[0, 1].scatter(targets[sample_idx], preds[sample_idx], alpha=0.2, s=4, c="#FF5722")
     lims = [
         min(targets[sample_idx].min(), preds[sample_idx].min()),
         max(targets[sample_idx].max(), preds[sample_idx].max()),
     ]
-    axes[1].plot(lims, lims, "r--", linewidth=1)
-    axes[1].set_title("Predicted vs Actual (sample)")
-    axes[1].set_xlabel("Actual Move (pts)")
-    axes[1].set_ylabel("Predicted Move (pts)")
-    axes[1].grid(True, alpha=0.3)
+    axes[0, 1].plot(lims, lims, "k--", linewidth=1, alpha=0.5)
+    axes[0, 1].set_title(f"Predicted vs Actual  (r={correlation:.3f})")
+    axes[0, 1].set_xlabel("Actual Move (pts)")
+    axes[0, 1].set_ylabel("Predicted Move (pts)")
+    axes[0, 1].grid(True, alpha=0.3)
+
+    # 3. Prediction distribution histogram
+    axes[1, 0].hist(targets, bins=80, alpha=0.5, label="Actual", color="#4CAF50", density=True)
+    axes[1, 0].hist(preds, bins=80, alpha=0.5, label="Predicted", color="#FF9800", density=True)
+    axes[1, 0].set_title("Distribution: Predicted vs Actual")
+    axes[1, 0].set_xlabel("Point Move")
+    axes[1, 0].set_ylabel("Density")
+    axes[1, 0].legend()
+    axes[1, 0].grid(True, alpha=0.3)
+
+    # 4. Training loss curve (if available)
+    if history and "train" in history and len(history["train"]) > 0:
+        epochs_range = range(1, len(history["train"]) + 1)
+        axes[1, 1].plot(epochs_range, history["train"], label="Train", linewidth=1.2, color="#2196F3")
+        axes[1, 1].plot(epochs_range, history["val"], label="Val", linewidth=1.2, color="#F44336")
+        axes[1, 1].set_title("Training & Validation Loss")
+        axes[1, 1].set_xlabel("Epoch")
+        axes[1, 1].set_ylabel("MSE Loss")
+        axes[1, 1].legend()
+        axes[1, 1].grid(True, alpha=0.3)
+    else:
+        # Trade P&L distribution
+        if total_trades > 1:
+            axes[1, 1].hist(trade_pnls, bins=60, color="#9C27B0", alpha=0.7)
+            axes[1, 1].axvline(x=0, color="red", linestyle="--", linewidth=1)
+            axes[1, 1].set_title("Trade P&L Distribution")
+            axes[1, 1].set_xlabel("P&L ($)")
+            axes[1, 1].set_ylabel("Count")
+            axes[1, 1].grid(True, alpha=0.3)
 
     plt.tight_layout()
     plt.savefig("backtest_results.png", dpi=150)
@@ -442,9 +644,11 @@ def backtest(model, test_loader, device, use_amp):
 # Main
 # ─────────────────────────────────────────────
 def main():
-    print("=" * 55)
-    print("  NQ Futures Prediction - CNN+LSTM Neural Network")
-    print("=" * 55)
+    print()
+    print("╔══════════════════════════════════════════════════════════════╗")
+    print("║        NQ FUTURES PREDICTION — CNN+LSTM NEURAL NETWORK     ║")
+    print("║        Lookback: 90 bars  |  Horizon: 15 bars              ║")
+    print("╚══════════════════════════════════════════════════════════════╝")
 
     # Setup
     device, batch_size, use_amp = setup_device()
@@ -458,17 +662,18 @@ def main():
     df = load_data(DATA_FILE)
 
     # Build features
-    print("\nEngineering features...")
     features_df = build_features(df)
 
     # Align close prices with features (features dropped some rows due to rolling)
     close_prices = df["close"].loc[features_df.index]
 
     # Create windowed samples
-    print("Creating sliding windows...")
     X, y = create_windows(features_df, close_prices, LOOKBACK, HORIZON)
-    print(f"Total samples: {len(y):,}")
-    print(f"Feature shape: {X.shape} (samples, lookback, features)")
+
+    # Target distribution info
+    tgt_up = np.sum(y > 0)
+    tgt_down = np.sum(y < 0)
+    tgt_flat = np.sum(y == 0)
 
     # Chronological split
     split_idx = int(len(y) * TRAIN_RATIO)
@@ -480,10 +685,27 @@ def main():
     X_train, X_val = X_train_full[:val_split], X_train_full[val_split:]
     y_train, y_val = y_train_full[:val_split], y_train_full[val_split:]
 
-    print(f"Train: {len(y_train):,} | Val: {len(y_val):,} | Test: {len(y_test):,}")
+    num_features = X_train.shape[2]
+
+    box("FEATURE ENGINEERING", [
+        f"Features per bar:          {num_features}",
+        f"Lookback window:           {LOOKBACK} bars",
+        f"Prediction horizon:        {HORIZON} bars",
+        f"Input shape:               ({LOOKBACK}, {num_features})",
+        "---",
+        f"Total samples:             {len(y):,}",
+        f"  Target > 0 (up):         {tgt_up:,}  ({tgt_up/len(y)*100:.1f}%)",
+        f"  Target < 0 (down):       {tgt_down:,}  ({tgt_down/len(y)*100:.1f}%)",
+        f"  Target = 0 (flat):       {tgt_flat:,}  ({tgt_flat/len(y)*100:.1f}%)",
+        f"  Target mean:             {np.mean(y):.4f} pts",
+        f"  Target std:              {np.std(y):.4f} pts",
+        "---",
+        f"Train:                     {len(y_train):,}  ({len(y_train)/len(y)*100:.0f}%)",
+        f"Validation:                {len(y_val):,}  ({len(y_val)/len(y)*100:.0f}%)",
+        f"Test (holdout):            {len(y_test):,}  ({len(y_test)/len(y)*100:.0f}%)",
+    ])
 
     # Normalize features using training stats only
-    num_features = X_train.shape[2]
     scaler = StandardScaler()
     X_train_flat = X_train.reshape(-1, num_features)
     scaler.fit(X_train_flat)
@@ -524,21 +746,36 @@ def main():
     # Model
     model = NQPredictor(num_features=num_features).to(device)
     total_params = sum(p.numel() for p in model.parameters())
-    print(f"\nModel parameters: {total_params:,}")
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+    box("MODEL ARCHITECTURE", [
+        f"Type:                      CNN + LSTM Hybrid",
+        f"Conv layers:               2x Conv1D (64, 128)",
+        f"LSTM:                      2 layers, 128 hidden",
+        f"FC head:                   128 → 64 → 1",
+        f"Total parameters:          {total_params:,}",
+        f"Trainable parameters:      {trainable:,}",
+        "---",
+        f"Optimizer:                 AdamW (lr={LEARNING_RATE}, wd={WEIGHT_DECAY})",
+        f"Loss:                      MSE",
+        f"Max epochs:                {MAX_EPOCHS}",
+        f"Early stop patience:       {EARLY_STOP_PATIENCE}",
+        f"LR scheduler patience:     {LR_PATIENCE}",
+        f"Gradient clipping:         {GRAD_CLIP}",
+    ])
 
     # Train
-    print("\nStarting training...")
     start_time = time.time()
-    model = train_model(model, train_loader, val_loader, device, use_amp)
+    model, history = train_model(model, train_loader, val_loader, device, use_amp)
     elapsed = time.time() - start_time
-    print(f"Training completed in {elapsed / 60:.1f} minutes")
+    print(f"  Wall time: {elapsed / 60:.1f} minutes")
 
     # Backtest
-    backtest(model, test_loader, device, use_amp)
+    backtest(model, test_loader, device, use_amp, history=history)
 
     # Save model
     torch.save(model.state_dict(), "nq_model.pt")
-    print("Model saved to nq_model.pt")
+    print("\nModel saved to nq_model.pt")
 
 
 if __name__ == "__main__":

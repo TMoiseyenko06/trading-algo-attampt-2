@@ -2,5 +2,6 @@ torch>=2.0
 databento
 pandas
 numpy
+scipy
 scikit-learn
 matplotlib

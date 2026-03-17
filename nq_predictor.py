@@ -543,6 +543,20 @@ def backtest(model, test_loader, device, use_amp, y_mean=0.0, y_std=1.0, history
         f"{'Entropy (bits):':30} {pred_entropy:>14.3f} {tgt_entropy:>14.3f}",
     ])
 
+    # Magnitude accuracy: % within various point thresholds
+    abs_errors = np.abs(errors)
+    within_5 = np.mean(abs_errors <= 5) * 100
+    within_10 = np.mean(abs_errors <= 10) * 100
+    within_25 = np.mean(abs_errors <= 25) * 100
+    within_50 = np.mean(abs_errors <= 50) * 100
+
+    # Combined: correct direction AND within threshold
+    correct_dir_mask = pred_dir == actual_dir
+    dir_and_5 = np.mean(correct_dir_mask & (abs_errors <= 5)) * 100
+    dir_and_10 = np.mean(correct_dir_mask & (abs_errors <= 10)) * 100
+    dir_and_25 = np.mean(correct_dir_mask & (abs_errors <= 25)) * 100
+    dir_and_50 = np.mean(correct_dir_mask & (abs_errors <= 50)) * 100
+
     box("MODEL ACCURACY", [
         f"Test Samples:              {len(preds):,}",
         f"MAE:                       {mae:.4f} pts",
@@ -555,6 +569,12 @@ def backtest(model, test_loader, device, use_amp, y_mean=0.0, y_std=1.0, history
         f"  Long predictions:        {long_count:,}  (acc: {long_acc:.1f}%)",
         f"  Short predictions:       {short_count:,}  (acc: {short_acc:.1f}%)",
         f"  Flat predictions:        {flat_count:,}",
+        "---",
+        f"{'Threshold':20} {'Within':>12} {'Dir + Within':>14}",
+        f"{'  ± 5  pts':20} {within_5:>11.1f}% {dir_and_5:>13.1f}%",
+        f"{'  ± 10 pts':20} {within_10:>11.1f}% {dir_and_10:>13.1f}%",
+        f"{'  ± 25 pts':20} {within_25:>11.1f}% {dir_and_25:>13.1f}%",
+        f"{'  ± 50 pts':20} {within_50:>11.1f}% {dir_and_50:>13.1f}%",
     ])
 
     box("TRADING PERFORMANCE", [

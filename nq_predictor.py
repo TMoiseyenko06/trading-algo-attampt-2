@@ -50,7 +50,7 @@ def setup_device():
     if torch.cuda.is_available():
         device = torch.device("cuda")
         props = torch.cuda.get_device_properties(0)
-        gpu_mem_gb = props.total_mem / (1024**3)
+        gpu_mem_gb = props.total_memory / (1024**3)
         gpu_name = props.name
         print(f"GPU Detected: {gpu_name}")
         print(f"GPU Memory:   {gpu_mem_gb:.1f} GB")

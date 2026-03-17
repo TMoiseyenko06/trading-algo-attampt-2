@@ -411,7 +411,7 @@ def compute_prediction_entropy(preds, n_bins=50):
     return scipy_entropy(hist, base=2)
 
 
-def backtest(model, test_loader, device, use_amp, history=None):
+def backtest(model, test_loader, device, use_amp, y_mean=0.0, y_std=1.0, history=None):
     """Run predictions on test set and compute comprehensive metrics."""
     model.eval()
     all_preds = []
@@ -427,6 +427,10 @@ def backtest(model, test_loader, device, use_amp, history=None):
 
     preds = np.concatenate(all_preds)
     targets = np.concatenate(all_targets)
+
+    # Denormalize predictions back to real NQ points
+    # (targets are already in real points since y_test was not normalized)
+    preds = preds * y_std + y_mean
 
     # ── Prediction Distribution Stats ──
     pred_mean = np.mean(preds)
@@ -705,6 +709,13 @@ def main():
         f"Test (holdout):            {len(y_test):,}  ({len(y_test)/len(y)*100:.0f}%)",
     ])
 
+    # Normalize targets using training stats (train on normalized, backtest on real points)
+    y_mean = float(y_train.mean())
+    y_std = float(y_train.std())
+    y_train = (y_train - y_mean) / y_std
+    y_val = (y_val - y_mean) / y_std
+    # y_test stays in real NQ points — predictions will be denormalized in backtest
+
     # Normalize features using training stats only
     scaler = StandardScaler()
     X_train_flat = X_train.reshape(-1, num_features)
@@ -770,8 +781,8 @@ def main():
     elapsed = time.time() - start_time
     print(f"  Wall time: {elapsed / 60:.1f} minutes")
 
-    # Backtest
-    backtest(model, test_loader, device, use_amp, history=history)
+    # Backtest (denormalize predictions back to real NQ points)
+    backtest(model, test_loader, device, use_amp, y_mean=y_mean, y_std=y_std, history=history)
 
     # Save model
     torch.save(model.state_dict(), "nq_model.pt")

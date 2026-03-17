@@ -86,7 +86,7 @@ def load_data(filepath):
     print(f"\nLoading data from {filepath}...")
     import databento as db
 
-    store = db.DBNStore.from_path(filepath)
+    store = db.DBNStore.from_file(filepath)
     df = store.to_df()
 
     print(f"Raw records: {len(df)}")

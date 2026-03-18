@@ -16,8 +16,11 @@ Requires:
 import os
 import sys
 import time
+import logging
 import argparse
 from datetime import datetime
+
+logger = logging.getLogger(__name__)
 
 from dotenv import load_dotenv
 
@@ -106,13 +109,9 @@ def calibrate_scaler(data_file, num_features):
 # ─────────────────────────────────────────────
 # TradingView data
 # ─────────────────────────────────────────────
-def connect_tv():
-    """Connect to TradingView using session token from environment.
-
-    The standard tvDatafeed username/password login is broken by TradingView's
-    reCAPTCHA.  Instead we inject an auth_token extracted from a browser session
-    (the ``sessionid`` cookie) directly into the TvDatafeed instance.
-    """
+def _make_tv():
+    """Create a fresh TvDatafeed instance with the session token and a longer
+    websocket timeout (the default 5 s is too aggressive)."""
     token = os.environ.get("TV_AUTH_TOKEN")
     if not token:
         print("ERROR: Set TV_AUTH_TOKEN in your .env file.")
@@ -121,46 +120,80 @@ def connect_tv():
         print("  3. Copy the value into .env as TV_AUTH_TOKEN=<value>")
         sys.exit(1)
 
-    print("  Connecting to TradingView with session token...")
-    tv = TvDatafeed()          # creates instance with unauthorized token
-    tv.token = token            # override with real session token
+    tv = TvDatafeed()
+    tv.token = token
+    # Bump the websocket timeout from the default 5 s to 30 s
+    TvDatafeed._TvDatafeed__ws_timeout = 30
     return tv
 
 
+def connect_tv():
+    """Connect to TradingView using session token from environment."""
+    print("  Connecting to TradingView with session token...")
+    tv = _make_tv()
+    return tv
+
+
+def _tv_call(tv, fn, max_retries=3, **kwargs):
+    """Call a TvDatafeed method with automatic reconnect on failure.
+
+    If the websocket drops (``Connection to remote host was lost``), we build
+    a brand-new TvDatafeed instance and retry up to *max_retries* times with
+    exponential back-off (2 s, 4 s, 8 s).
+    """
+    for attempt in range(1, max_retries + 1):
+        try:
+            result = fn(**kwargs)
+            return tv, result
+        except Exception as e:
+            logger.warning(f"  TV call failed (attempt {attempt}/{max_retries}): {e}")
+            if attempt < max_retries:
+                wait = 2 ** attempt
+                print(f"  Reconnecting in {wait}s...")
+                time.sleep(wait)
+                tv = _make_tv()
+            else:
+                print(f"  TV call failed after {max_retries} attempts.")
+                return tv, None
+
+
 def fetch_bars(tv, symbol, exchange, n_bars=FETCH_BARS):
-    """Fetch recent 1-minute bars from TradingView."""
-    df = tv.get_hist(
+    """Fetch recent 1-minute bars from TradingView (with auto-reconnect)."""
+    tv, df = _tv_call(
+        tv,
+        tv.get_hist,
         symbol=symbol,
         exchange=exchange,
         interval=Interval.in_1_minute,
         n_bars=n_bars,
     )
-    if df is None or df.empty:
-        return None
+    if df is None or (hasattr(df, "empty") and df.empty):
+        return tv, None
 
     # tvDatafeed returns columns: open, high, low, close, volume
-    # Ensure standard column names
     df.columns = [c.lower() for c in df.columns]
     required = ["open", "high", "low", "close", "volume"]
     for col in required:
         if col not in df.columns:
             print(f"  WARNING: Missing column '{col}' in TradingView data")
-            return None
+            return tv, None
 
-    return df[required].copy()
+    return tv, df[required].copy()
 
 
 def fetch_latest_price(tv, symbol, exchange):
-    """Fetch the most recent close price."""
-    df = tv.get_hist(
+    """Fetch the most recent close price (with auto-reconnect)."""
+    tv, df = _tv_call(
+        tv,
+        tv.get_hist,
         symbol=symbol,
         exchange=exchange,
         interval=Interval.in_1_minute,
         n_bars=2,
     )
-    if df is None or df.empty:
-        return None
-    return float(df["close"].iloc[-1])
+    if df is None or (hasattr(df, "empty") and df.empty):
+        return tv, None
+    return tv, float(df["close"].iloc[-1])
 
 
 # ─────────────────────────────────────────────
@@ -201,7 +234,7 @@ def predict(model, device, scaler, y_mean, y_std, num_features, raw_df):
 # ─────────────────────────────────────────────
 def monitor_trade(tv, symbol, exchange, direction, entry_price, tp_level, sl_level,
                   poll_interval):
-    """Poll price until TP, SL, or expiry (HORIZON bars). Returns exit info dict."""
+    """Poll price until TP, SL, or expiry (HORIZON bars). Returns (tv, exit_info)."""
     bars_elapsed = 0
     last_bar_time = datetime.now()
 
@@ -211,7 +244,7 @@ def monitor_trade(tv, symbol, exchange, direction, entry_price, tp_level, sl_lev
     while bars_elapsed < HORIZON:
         time.sleep(poll_interval)
 
-        price = fetch_latest_price(tv, symbol, exchange)
+        tv, price = fetch_latest_price(tv, symbol, exchange)
         if price is None:
             print(f"  [{timestamp()}] Price fetch failed, retrying...")
             continue
@@ -236,7 +269,7 @@ def monitor_trade(tv, symbol, exchange, direction, entry_price, tp_level, sl_lev
 
         # Check TP
         if move_in_direction >= tp_level:
-            return {
+            return tv, {
                 "reason": "TP HIT",
                 "exit_price": price,
                 "pnl_points": tp_level,
@@ -246,7 +279,7 @@ def monitor_trade(tv, symbol, exchange, direction, entry_price, tp_level, sl_lev
 
         # Check SL
         if move_in_direction <= -sl_level:
-            return {
+            return tv, {
                 "reason": "SL HIT",
                 "exit_price": price,
                 "pnl_points": -sl_level,
@@ -255,12 +288,12 @@ def monitor_trade(tv, symbol, exchange, direction, entry_price, tp_level, sl_lev
             }
 
     # Expiry — fetch final price
-    price = fetch_latest_price(tv, symbol, exchange)
+    tv, price = fetch_latest_price(tv, symbol, exchange)
     if price is None:
         price = entry_price  # fallback
     move = price - entry_price
     pnl_points = direction * move
-    return {
+    return tv, {
         "reason": "EXPIRY",
         "exit_price": price,
         "pnl_points": pnl_points,
@@ -308,7 +341,7 @@ def run(args):
     try:
         while True:
             # 1. Fetch recent bars
-            raw_df = fetch_bars(tv, args.symbol, args.exchange)
+            tv, raw_df = fetch_bars(tv, args.symbol, args.exchange)
             if raw_df is None:
                 print(f"  [{timestamp()}] Data fetch failed, retrying in 60s...")
                 time.sleep(60)
@@ -351,7 +384,7 @@ def run(args):
             print(f"  Max bars:      {HORIZON}")
 
             # 6. Monitor trade
-            result = monitor_trade(
+            tv, result = monitor_trade(
                 tv, args.symbol, args.exchange,
                 direction, entry_price, tp_level, sl_level,
                 args.poll_interval,

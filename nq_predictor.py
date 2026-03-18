@@ -257,7 +257,7 @@ def create_windows(features_df, close_prices, lookback, horizon):
 # Model: CNN + LSTM Hybrid
 # ─────────────────────────────────────────────
 class NQPredictor(nn.Module):
-    def __init__(self, num_features):
+    def __init__(self, num_features, dropout=0.4):
         super().__init__()
 
         # CNN layers to capture local patterns
@@ -265,7 +265,7 @@ class NQPredictor(nn.Module):
         self.bn1 = nn.BatchNorm1d(64)
         self.conv2 = nn.Conv1d(64, 128, kernel_size=3, padding=1)
         self.bn2 = nn.BatchNorm1d(128)
-        self.cnn_dropout = nn.Dropout(0.4)
+        self.cnn_dropout = nn.Dropout(dropout)
 
         # LSTM for temporal dependencies
         self.lstm = nn.LSTM(
@@ -273,14 +273,14 @@ class NQPredictor(nn.Module):
             hidden_size=128,
             num_layers=2,
             batch_first=True,
-            dropout=0.4,
+            dropout=dropout,
         )
 
         # Fully connected head
         self.fc = nn.Sequential(
             nn.Linear(128, 64),
             nn.ReLU(),
-            nn.Dropout(0.5),
+            nn.Dropout(min(dropout + 0.1, 0.8)),
             nn.Linear(64, 1),
         )
 
@@ -306,13 +306,16 @@ class NQPredictor(nn.Module):
 # ─────────────────────────────────────────────
 # Training
 # ─────────────────────────────────────────────
-def train_model(model, train_loader, val_loader, device, use_amp):
+def train_model(model, train_loader, val_loader, device, use_amp,
+                 lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY,
+                 max_epochs=MAX_EPOCHS, early_stop_patience=EARLY_STOP_PATIENCE,
+                 lr_patience=LR_PATIENCE, grad_clip=GRAD_CLIP):
     """Train with early stopping, LR scheduling, gradient clipping, and AMP."""
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY
+        model.parameters(), lr=lr, weight_decay=weight_decay
     )
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=LR_PATIENCE
+        optimizer, mode="min", factor=0.5, patience=lr_patience
     )
     criterion = nn.HuberLoss(delta=1.0)
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
@@ -328,7 +331,7 @@ def train_model(model, train_loader, val_loader, device, use_amp):
     print("│ Epoch │  Train Loss  │   Val Loss   │     LR     │  Status   │")
     print("├───────┼──────────────┼──────────────┼────────────┼───────────┤")
 
-    for epoch in range(1, MAX_EPOCHS + 1):
+    for epoch in range(1, max_epochs + 1):
         # ── Train ──
         model.train()
         train_losses = []
@@ -342,7 +345,7 @@ def train_model(model, train_loader, val_loader, device, use_amp):
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+            nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             scaler.step(optimizer)
             scaler.update()
 
@@ -378,7 +381,7 @@ def train_model(model, train_loader, val_loader, device, use_amp):
             status = "★ best"
         else:
             patience_counter += 1
-            if patience_counter >= EARLY_STOP_PATIENCE:
+            if patience_counter >= early_stop_patience:
                 print(f"│  {epoch:>3}  │  {avg_train:>10.4f}  │  {avg_val:>10.4f}  │  {current_lr:>8.6f}  │  STOP     │")
                 break
 
@@ -401,7 +404,7 @@ def train_model(model, train_loader, val_loader, device, use_amp):
             f"Best Val Loss:   {best_val_loss:.4f}",
             f"Final Train Loss:{final_train:.4f}",
             f"Overfit Ratio:   {overfit_ratio:.3f}  (val/train, ~1.0 = good)",
-            f"Early Stopped:   {'Yes' if patience_counter >= EARLY_STOP_PATIENCE else 'No'}",
+            f"Early Stopped:   {'Yes' if patience_counter >= early_stop_patience else 'No'}",
         ])
 
     return model, history
@@ -873,6 +876,34 @@ def parse_args():
         help=f"Min predicted move (pts) to enter a trade (default: {TRADE_THRESHOLD})",
     )
     parser.add_argument(
+        "--lr", type=float, default=LEARNING_RATE,
+        help=f"Learning rate (default: {LEARNING_RATE})",
+    )
+    parser.add_argument(
+        "--epochs", type=int, default=MAX_EPOCHS,
+        help=f"Max training epochs (default: {MAX_EPOCHS})",
+    )
+    parser.add_argument(
+        "--patience", type=int, default=EARLY_STOP_PATIENCE,
+        help=f"Early stopping patience in epochs (default: {EARLY_STOP_PATIENCE})",
+    )
+    parser.add_argument(
+        "--lr-patience", type=int, default=LR_PATIENCE,
+        help=f"LR scheduler patience in epochs (default: {LR_PATIENCE})",
+    )
+    parser.add_argument(
+        "--weight-decay", type=float, default=WEIGHT_DECAY,
+        help=f"AdamW weight decay (default: {WEIGHT_DECAY})",
+    )
+    parser.add_argument(
+        "--dropout", type=float, default=0.4,
+        help="Dropout rate for CNN and LSTM layers (default: 0.4)",
+    )
+    parser.add_argument(
+        "--grad-clip", type=float, default=GRAD_CLIP,
+        help=f"Gradient clipping max norm (default: {GRAD_CLIP})",
+    )
+    parser.add_argument(
         "--tp", type=float, default=None, metavar="PCT",
         help="Take-profit as a fraction of the prediction (e.g. 0.5 = 50%%). "
              "Requires --sl. Runs SL/TP backtest mode.",
@@ -996,7 +1027,7 @@ def main():
     )
 
     # Model
-    model = NQPredictor(num_features=num_features).to(device)
+    model = NQPredictor(num_features=num_features, dropout=args.dropout).to(device)
     total_params = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
@@ -1026,12 +1057,13 @@ def main():
         f"Trainable parameters:      {trainable:,}",
         resume_label,
         "---",
-        f"Optimizer:                 AdamW (lr={LEARNING_RATE}, wd={WEIGHT_DECAY})",
-        f"Loss:                      MSE",
-        f"Max epochs:                {MAX_EPOCHS}",
-        f"Early stop patience:       {EARLY_STOP_PATIENCE}",
-        f"LR scheduler patience:     {LR_PATIENCE}",
-        f"Gradient clipping:         {GRAD_CLIP}",
+        f"Optimizer:                 AdamW (lr={args.lr}, wd={args.weight_decay})",
+        f"Loss:                      HuberLoss",
+        f"Max epochs:                {args.epochs}",
+        f"Early stop patience:       {args.patience}",
+        f"LR scheduler patience:     {args.lr_patience}",
+        f"Dropout:                   {args.dropout}",
+        f"Gradient clipping:         {args.grad_clip}",
     ])
 
     # Train (unless backtest-only mode)
@@ -1043,7 +1075,12 @@ def main():
         print("\nSkipping training (--backtest-only mode)")
     else:
         start_time = time.time()
-        model, history = train_model(model, train_loader, val_loader, device, use_amp)
+        model, history = train_model(
+            model, train_loader, val_loader, device, use_amp,
+            lr=args.lr, weight_decay=args.weight_decay,
+            max_epochs=args.epochs, early_stop_patience=args.patience,
+            lr_patience=args.lr_patience, grad_clip=args.grad_clip,
+        )
         elapsed = time.time() - start_time
         print(f"  Wall time: {elapsed / 60:.1f} minutes")
 

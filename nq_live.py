@@ -181,6 +181,27 @@ def fetch_bars(tv, symbol, exchange, n_bars=FETCH_BARS):
     return tv, df[required].copy()
 
 
+def load_csv(path):
+    """Load OHLCV data from a TradingView-exported CSV file."""
+    import pandas as pd
+
+    df = pd.read_csv(path)
+    df.columns = [c.strip().lower() for c in df.columns]
+    # TV exports 'volume' or 'Volume' — normalize
+    if "volume" not in df.columns:
+        for col in df.columns:
+            if "vol" in col:
+                df = df.rename(columns={col: "volume"})
+                break
+    required = ["open", "high", "low", "close", "volume"]
+    for col in required:
+        if col not in df.columns:
+            print(f"ERROR: CSV missing required column '{col}'")
+            print(f"  Found columns: {list(df.columns)}")
+            sys.exit(1)
+    return df[required].copy()
+
+
 def fetch_latest_price(tv, symbol, exchange):
     """Fetch the most recent close price (with auto-reconnect)."""
     tv, df = _tv_call(
@@ -327,6 +348,36 @@ def run(args):
     # Calibrate scaler
     scaler = calibrate_scaler(args.data_file, num_features)
 
+    # CSV mode: single prediction, no TradingView needed
+    if args.csv:
+        banner("NQ PREDICTION — CSV MODE")
+        raw_df = load_csv(args.csv)
+        print(f"  Loaded {len(raw_df)} bars from {args.csv}")
+
+        pred_points, entry_price = predict(
+            model, device, scaler, y_mean, y_std, num_features, raw_df
+        )
+        if pred_points is None:
+            print("  ERROR: Not enough data for prediction (need ~150+ bars)")
+            sys.exit(1)
+
+        direction = "LONG" if pred_points > 0 else "SHORT"
+        tp = abs(pred_points) * args.tp_pct
+        sl = tp * args.sl_pct
+        entry = entry_price
+
+        print(f"  Predicted move: {pred_points:+.2f} pts")
+        print(f"  Direction:      {direction}")
+        print(f"  Entry price:    {entry:,.2f}")
+        print(f"  TP: {tp:+.2f} pts -> {entry + (1 if pred_points > 0 else -1) * tp:,.2f}")
+        print(f"  SL: {-sl:+.2f} pts -> {entry - (1 if pred_points > 0 else -1) * sl:,.2f}")
+        print(f"  Threshold:      {args.threshold} pts")
+        if abs(pred_points) < args.threshold:
+            print(f"  ** Below threshold — would NOT trade **")
+        else:
+            print(f"  ** Above threshold — would ENTER {direction} **")
+        return
+
     # Connect to TradingView
     tv = connect_tv()
 
@@ -443,6 +494,8 @@ def parse_args():
                         help=f"Model checkpoint file (default: {CHECKPOINT_FILE})")
     parser.add_argument("--data-file", type=str, default=DATA_FILE,
                         help=f"Training data for scaler calibration (default: {DATA_FILE})")
+    parser.add_argument("--csv", type=str, default=None,
+                        help="Path to CSV file with OHLCV data (bypasses TradingView)")
     parser.add_argument("--symbol", type=str, default="NQ1!",
                         help="TradingView symbol (default: NQ1!)")
     parser.add_argument("--exchange", type=str, default="CME",

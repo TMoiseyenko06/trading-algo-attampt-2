@@ -1,7 +1,7 @@
 """
 NQ Futures Live Trading Module
 ===============================
-Fetches real-time 1-minute bars from Rithmic, runs predictions through
+Fetches real-time 1-minute bars from Databento, runs predictions through
 the trained CNN+LSTM model, and manages trades with TP/SL/expiry logic.
 
 Trade entry/exit is printed to CLI (manual execution).
@@ -9,15 +9,13 @@ Trade entry/exit is printed to CLI (manual execution).
 Requires:
   - Trained checkpoint (nq_checkpoint.pt)
   - Training data (nq.dbn) for scaler calibration
-  - Rithmic credentials in .env: RITHMIC_USER, RITHMIC_PASSWORD,
-    RITHMIC_SYSTEM_NAME, RITHMIC_URL
-  - pip install async_rithmic
+  - Databento API key in .env: DATABENTO_API_KEY
+  - pip install databento
 """
 
 import os
 import sys
 import time
-import asyncio
 import logging
 import argparse
 from datetime import datetime, timedelta
@@ -29,8 +27,8 @@ from dotenv import load_dotenv
 import numpy as np
 import pandas as pd
 import torch
+import databento as db
 from sklearn.preprocessing import StandardScaler
-from async_rithmic import RithmicClient, TimeBarType
 
 # Reuse model, features, and data loading from the training module
 from nq_predictor import (
@@ -51,6 +49,10 @@ from nq_predictor import (
 # build_features() needs ~60 bars of warm-up (SMA60 is the longest rolling window),
 # plus LOOKBACK (90) bars of usable features = 150 minimum. Add buffer.
 FETCH_BARS = 200
+
+# Databento config
+DATABENTO_DATASET = "GLBX.MDP3"
+DATABENTO_SYMBOL = "NQ.n.0"  # front-month by open interest
 
 
 # ─────────────────────────────────────────────
@@ -110,188 +112,118 @@ def calibrate_scaler(data_file, num_features):
 
 
 # ─────────────────────────────────────────────
-# Rithmic data
+# Databento data
 # ─────────────────────────────────────────────
-def _get_rithmic_env():
-    """Read and validate Rithmic credentials from environment."""
-    user = os.environ.get("RITHMIC_USER")
-    password = os.environ.get("RITHMIC_PASSWORD")
-    system_name = os.environ.get("RITHMIC_SYSTEM_NAME")
-    url = os.environ.get("RITHMIC_URL")
-
-    if not all([user, password, system_name, url]):
-        print("ERROR: Missing Rithmic credentials in .env file.")
-        print("  Required variables:")
-        print("    RITHMIC_USER=your_username")
-        print("    RITHMIC_PASSWORD=your_password")
-        print("    RITHMIC_SYSTEM_NAME=Rithmic Paper Trading")
-        print("    RITHMIC_URL=rituz00100.rithmic.com:443")
+def _get_databento_client():
+    """Create a Databento Historical client from env API key."""
+    api_key = os.environ.get("DATABENTO_API_KEY")
+    if not api_key:
+        print("ERROR: Missing DATABENTO_API_KEY in .env file.")
+        print("  Required variable:")
+        print("    DATABENTO_API_KEY=db-your-api-key-here")
         sys.exit(1)
-
-    return user, password, system_name, url
-
-
-def _make_client():
-    """Create a new RithmicClient from env credentials."""
-    user, password, system_name, url = _get_rithmic_env()
-    return RithmicClient(
-        user=user,
-        password=password,
-        system_name=system_name,
-        app_name="nq_live_trading",
-        app_version="1.0",
-        url=url,
-    )
+    return db.Historical(api_key)
 
 
-async def _connect_and_resolve(symbol, exchange):
-    """Connect to Rithmic and resolve front-month contract. Returns (client, security_code)."""
-    client = _make_client()
-    await client.connect()
-
-    # Resolve front-month contract (e.g., "NQ" -> "NQM6")
-    security_code = await client.get_front_month_contract(symbol, exchange)
-    print(f"  Resolved front-month contract: {security_code}")
-    return client, security_code
-
-
-async def _fetch_bars_async(client, security_code, exchange, n_bars=FETCH_BARS):
-    """Fetch recent 1-minute bars from Rithmic history."""
-    end_time = datetime.now()
-    # Request extra bars to account for gaps (weekends, holidays, off-hours)
-    start_time = end_time - timedelta(minutes=n_bars * 3)
-
-    bars = await client.get_historical_time_bars(
-        security_code,
-        exchange,
-        start_time,
-        end_time,
-        TimeBarType.MINUTE_BAR,
-        1,
-    )
-
-    if not bars:
-        return None
-
-    # Convert bar dicts to DataFrame
-    rows = []
-    for bar in bars:
-        # async_rithmic bar keys may vary — handle common naming conventions
-        row = {
-            "open": bar.get("open_price", bar.get("open", 0)),
-            "high": bar.get("high_price", bar.get("high", 0)),
-            "low": bar.get("low_price", bar.get("low", 0)),
-            "close": bar.get("close_price", bar.get("close", 0)),
-            "volume": bar.get("volume", 0),
-        }
-        rows.append(row)
-
-    df = pd.DataFrame(rows)
-
-    # Keep only the last n_bars
-    if len(df) > n_bars:
-        df = df.iloc[-n_bars:]
-
-    df = df.reset_index(drop=True)
-    return df
-
-
-async def _fetch_latest_price_async(client, security_code, exchange):
-    """Fetch the most recent close price from Rithmic."""
-    end_time = datetime.now()
-    start_time = end_time - timedelta(minutes=5)
-
-    bars = await client.get_historical_time_bars(
-        security_code,
-        exchange,
-        start_time,
-        end_time,
-        TimeBarType.MINUTE_BAR,
-        1,
-    )
-
-    if not bars:
-        return None
-
-    last_bar = bars[-1]
-    return float(last_bar.get("close_price", last_bar.get("close", 0)))
-
-
-def connect_rithmic(symbol, exchange):
-    """Connect to Rithmic and resolve the front-month contract (sync wrapper)."""
-    print("  Connecting to Rithmic...")
-    client, security_code = asyncio.run(_connect_and_resolve(symbol, exchange))
-    return client, security_code
-
-
-async def _reconnect_and_fetch_bars(symbol, exchange, n_bars):
-    """Reconnect and fetch bars in one async call."""
-    client, security_code = await _connect_and_resolve(symbol, exchange)
-    df = await _fetch_bars_async(client, security_code, exchange, n_bars)
-    return client, security_code, df
-
-
-async def _reconnect_and_fetch_price(symbol, exchange):
-    """Reconnect and fetch latest price in one async call."""
-    client, security_code = await _connect_and_resolve(symbol, exchange)
-    price = await _fetch_latest_price_async(client, security_code, exchange)
-    return client, security_code, price
-
-
-def fetch_bars(client, security_code, symbol, exchange, n_bars=FETCH_BARS, max_retries=3):
-    """Fetch recent 1-minute bars from Rithmic (with auto-reconnect)."""
+def fetch_bars(n_bars=FETCH_BARS, max_retries=3):
+    """Fetch recent 1-minute bars from Databento (with retry)."""
     for attempt in range(1, max_retries + 1):
         try:
-            df = asyncio.run(_fetch_bars_async(client, security_code, exchange, n_bars))
-            if df is not None and not df.empty:
-                return client, security_code, df
-        except Exception as e:
-            logger.warning(f"  Rithmic fetch failed (attempt {attempt}/{max_retries}): {e}")
+            client = _get_databento_client()
+            end_time = datetime.utcnow()
+            # Request extra time to account for gaps (weekends, holidays, off-hours)
+            start_time = end_time - timedelta(minutes=n_bars * 3)
 
-        if attempt < max_retries:
-            wait = 2 ** attempt
-            print(f"  Reconnecting in {wait}s...")
-            time.sleep(wait)
-            try:
-                client, security_code, df = asyncio.run(
-                    _reconnect_and_fetch_bars(symbol, exchange, n_bars)
-                )
-                if df is not None and not df.empty:
-                    return client, security_code, df
-            except Exception as e:
-                logger.warning(f"  Reconnect failed: {e}")
-
-    print(f"  Rithmic fetch failed after {max_retries} attempts.")
-    return client, security_code, None
-
-
-def fetch_latest_price(client, security_code, symbol, exchange, max_retries=3):
-    """Fetch the most recent close price from Rithmic (with auto-reconnect)."""
-    for attempt in range(1, max_retries + 1):
-        try:
-            price = asyncio.run(
-                _fetch_latest_price_async(client, security_code, exchange)
+            data = client.timeseries.get_range(
+                dataset=DATABENTO_DATASET,
+                symbols=DATABENTO_SYMBOL,
+                stype_in="continuous",
+                schema="ohlcv-1m",
+                start=start_time.strftime("%Y-%m-%dT%H:%M"),
+                end=end_time.strftime("%Y-%m-%dT%H:%M"),
             )
-            if price is not None:
-                return client, security_code, price
+
+            df = data.to_df()
+            if df.empty:
+                logger.warning(f"  Databento returned empty data (attempt {attempt}/{max_retries})")
+                if attempt < max_retries:
+                    time.sleep(2 ** attempt)
+                continue
+
+            # Databento stores prices as fixed-point integers (1e-9 scale)
+            price_cols = ["open", "high", "low", "close"]
+            for col in price_cols:
+                if col in df.columns and df[col].median() > 1e6:
+                    df[col] = df[col] / 1e9
+
+            # Ensure volume column exists
+            if "volume" not in df.columns and "size" in df.columns:
+                df["volume"] = df["size"]
+
+            # Keep only OHLCV
+            keep_cols = [c for c in ["open", "high", "low", "close", "volume"] if c in df.columns]
+            df = df[keep_cols].copy()
+            df = df.dropna()
+            df = df[(df["close"] > 0) & (df["volume"] >= 0)]
+
+            # Keep only the last n_bars
+            if len(df) > n_bars:
+                df = df.iloc[-n_bars:]
+
+            df = df.reset_index(drop=True)
+            return df
+
+        except Exception as e:
+            logger.warning(f"  Databento fetch failed (attempt {attempt}/{max_retries}): {e}")
+            if attempt < max_retries:
+                wait = 2 ** attempt
+                print(f"  Retrying in {wait}s...")
+                time.sleep(wait)
+
+    print(f"  Databento fetch failed after {max_retries} attempts.")
+    return None
+
+
+def fetch_latest_price(max_retries=3):
+    """Fetch the most recent close price from Databento."""
+    for attempt in range(1, max_retries + 1):
+        try:
+            client = _get_databento_client()
+            end_time = datetime.utcnow()
+            start_time = end_time - timedelta(minutes=5)
+
+            data = client.timeseries.get_range(
+                dataset=DATABENTO_DATASET,
+                symbols=DATABENTO_SYMBOL,
+                stype_in="continuous",
+                schema="ohlcv-1m",
+                start=start_time.strftime("%Y-%m-%dT%H:%M"),
+                end=end_time.strftime("%Y-%m-%dT%H:%M"),
+            )
+
+            df = data.to_df()
+            if df.empty:
+                logger.warning(f"  No recent bars returned (attempt {attempt}/{max_retries})")
+                if attempt < max_retries:
+                    time.sleep(2 ** attempt)
+                continue
+
+            close_col = df["close"].iloc[-1]
+            price = float(close_col)
+            # Handle fixed-point prices
+            if price > 1e6:
+                price = price / 1e9
+            return price
+
         except Exception as e:
             logger.warning(f"  Price fetch failed (attempt {attempt}/{max_retries}): {e}")
-
-        if attempt < max_retries:
-            wait = 2 ** attempt
-            print(f"  Reconnecting in {wait}s...")
-            time.sleep(wait)
-            try:
-                client, security_code, price = asyncio.run(
-                    _reconnect_and_fetch_price(symbol, exchange)
-                )
-                if price is not None:
-                    return client, security_code, price
-            except Exception as e:
-                logger.warning(f"  Reconnect failed: {e}")
+            if attempt < max_retries:
+                wait = 2 ** attempt
+                print(f"  Retrying in {wait}s...")
+                time.sleep(wait)
 
     print(f"  Price fetch failed after {max_retries} attempts.")
-    return client, security_code, None
+    return None
 
 
 def load_csv(path):
@@ -353,9 +285,8 @@ def predict(model, device, scaler, y_mean, y_std, num_features, raw_df):
 # ─────────────────────────────────────────────
 # Trade monitoring
 # ─────────────────────────────────────────────
-def monitor_trade(client, security_code, symbol, exchange,
-                  direction, entry_price, tp_level, sl_level, poll_interval):
-    """Poll price until TP, SL, or expiry (HORIZON bars). Returns (client, security_code, exit_info)."""
+def monitor_trade(direction, entry_price, tp_level, sl_level, poll_interval):
+    """Poll price until TP, SL, or expiry (HORIZON bars). Returns exit_info dict."""
     bars_elapsed = 0
     last_bar_time = datetime.now()
 
@@ -365,9 +296,7 @@ def monitor_trade(client, security_code, symbol, exchange,
     while bars_elapsed < HORIZON:
         time.sleep(poll_interval)
 
-        client, security_code, price = fetch_latest_price(
-            client, security_code, symbol, exchange
-        )
+        price = fetch_latest_price()
         if price is None:
             print(f"  [{timestamp()}] Price fetch failed, retrying...")
             continue
@@ -392,7 +321,7 @@ def monitor_trade(client, security_code, symbol, exchange,
 
         # Check TP
         if move_in_direction >= tp_level:
-            return client, security_code, {
+            return {
                 "reason": "TP HIT",
                 "exit_price": price,
                 "pnl_points": tp_level,
@@ -402,7 +331,7 @@ def monitor_trade(client, security_code, symbol, exchange,
 
         # Check SL
         if move_in_direction <= -sl_level:
-            return client, security_code, {
+            return {
                 "reason": "SL HIT",
                 "exit_price": price,
                 "pnl_points": -sl_level,
@@ -411,14 +340,12 @@ def monitor_trade(client, security_code, symbol, exchange,
             }
 
     # Expiry — fetch final price
-    client, security_code, price = fetch_latest_price(
-        client, security_code, symbol, exchange
-    )
+    price = fetch_latest_price()
     if price is None:
         price = entry_price  # fallback
     move = price - entry_price
     pnl_points = direction * move
-    return client, security_code, {
+    return {
         "reason": "EXPIRY",
         "exit_price": price,
         "pnl_points": pnl_points,
@@ -437,7 +364,7 @@ def run(args):
     banner("NQ LIVE TRADING MODULE")
     print(f"  Device:       {device}")
     print(f"  Checkpoint:   {args.checkpoint}")
-    print(f"  Symbol:       {args.symbol} ({args.exchange})")
+    print(f"  Data source:  Databento ({DATABENTO_DATASET}, {DATABENTO_SYMBOL})")
     print(f"  TP pct:       {args.tp_pct}")
     print(f"  SL pct:       {args.sl_pct}")
     print(f"  Threshold:    {args.threshold} pts")
@@ -452,7 +379,7 @@ def run(args):
     # Calibrate scaler
     scaler = calibrate_scaler(args.data_file, num_features)
 
-    # CSV mode: single prediction, no Rithmic needed
+    # CSV mode: single prediction, no Databento needed
     if args.csv:
         banner("NQ PREDICTION — CSV MODE")
         raw_df = load_csv(args.csv)
@@ -482,8 +409,9 @@ def run(args):
             print(f"  ** Above threshold — would ENTER {direction} **")
         return
 
-    # Connect to Rithmic
-    client, security_code = connect_rithmic(args.symbol, args.exchange)
+    # Verify Databento credentials
+    _get_databento_client()
+    print("  Databento API key verified.")
 
     # Session stats
     total_trades = 0
@@ -496,9 +424,7 @@ def run(args):
     try:
         while True:
             # 1. Fetch recent bars
-            client, security_code, raw_df = fetch_bars(
-                client, security_code, args.symbol, args.exchange
-            )
+            raw_df = fetch_bars()
             if raw_df is None:
                 print(f"  [{timestamp()}] Data fetch failed, retrying in 60s...")
                 time.sleep(60)
@@ -541,8 +467,7 @@ def run(args):
             print(f"  Max bars:      {HORIZON}")
 
             # 6. Monitor trade
-            client, security_code, result = monitor_trade(
-                client, security_code, args.symbol, args.exchange,
+            result = monitor_trade(
                 direction, entry_price, tp_level, sl_level,
                 args.poll_interval,
             )
@@ -586,7 +511,7 @@ def run(args):
 # ─────────────────────────────────────────────
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="NQ Live Trading — CNN+LSTM predictions with Rithmic data"
+        description="NQ Live Trading — CNN+LSTM predictions with Databento data"
     )
     parser.add_argument("--tp-pct", type=float, default=1.0,
                         help="TP as fraction of predicted move (default: 1.0)")
@@ -601,11 +526,7 @@ def parse_args():
     parser.add_argument("--data-file", type=str, default=DATA_FILE,
                         help=f"Training data for scaler calibration (default: {DATA_FILE})")
     parser.add_argument("--csv", type=str, default=None,
-                        help="Path to CSV file with OHLCV data (bypasses Rithmic)")
-    parser.add_argument("--symbol", type=str, default="NQ",
-                        help="Rithmic root symbol (default: NQ)")
-    parser.add_argument("--exchange", type=str, default="CME",
-                        help="Exchange (default: CME)")
+                        help="Path to CSV file with OHLCV data (bypasses Databento)")
     return parser.parse_args()
 
 

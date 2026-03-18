@@ -187,12 +187,16 @@ def load_csv(path):
 
     df = pd.read_csv(path)
     df.columns = [c.strip().lower() for c in df.columns]
-    # TV exports 'volume' or 'Volume' — normalize
+    # TV uses various volume column names — try to find it
     if "volume" not in df.columns:
         for col in df.columns:
             if "vol" in col:
                 df = df.rename(columns={col: "volume"})
                 break
+    # If still no volume column, fill with zeros (model can still predict)
+    if "volume" not in df.columns:
+        print("  NOTE: No volume column found, filling with zeros")
+        df["volume"] = 0.0
     required = ["open", "high", "low", "close", "volume"]
     for col in required:
         if col not in df.columns:

@@ -9,7 +9,7 @@ Trade entry/exit is printed to CLI (manual execution).
 Requires:
   - Trained checkpoint (nq_checkpoint.pt)
   - Training data (nq.dbn) for scaler calibration
-  - TradingView credentials: TV_USERNAME / TV_PASSWORD env vars
+  - TradingView session token: TV_AUTH_TOKEN in .env
   - pip install tvdatafeed
 """
 
@@ -107,15 +107,23 @@ def calibrate_scaler(data_file, num_features):
 # TradingView data
 # ─────────────────────────────────────────────
 def connect_tv():
-    """Connect to TradingView using credentials from environment."""
-    username = os.environ.get("TV_USERNAME")
-    password = os.environ.get("TV_PASSWORD")
-    if not username or not password:
-        print("ERROR: Set TV_USERNAME and TV_PASSWORD environment variables.")
+    """Connect to TradingView using session token from environment.
+
+    The standard tvDatafeed username/password login is broken by TradingView's
+    reCAPTCHA.  Instead we inject an auth_token extracted from a browser session
+    (the ``sessionid`` cookie) directly into the TvDatafeed instance.
+    """
+    token = os.environ.get("TV_AUTH_TOKEN")
+    if not token:
+        print("ERROR: Set TV_AUTH_TOKEN in your .env file.")
+        print("  1. Log into tradingview.com in your browser")
+        print("  2. DevTools (F12) → Application → Cookies → sessionid")
+        print("  3. Copy the value into .env as TV_AUTH_TOKEN=<value>")
         sys.exit(1)
 
-    print(f"  Connecting to TradingView as {username}...")
-    tv = TvDatafeed(username=username, password=password)
+    print("  Connecting to TradingView with session token...")
+    tv = TvDatafeed()          # creates instance with unauthorized token
+    tv.token = token            # override with real session token
     return tv
 
 

@@ -5,5 +5,5 @@ numpy
 scipy
 scikit-learn
 matplotlib
-tvdatafeed
+tradingview-datafeed
 python-dotenv

@@ -51,10 +51,10 @@ HORIZON = 15  # bars to predict ahead
 TRAIN_RATIO = 0.80
 VAL_RATIO = 0.10  # of training portion
 MAX_EPOCHS = 200
-EARLY_STOP_PATIENCE = 15
+EARLY_STOP_PATIENCE = 25
 LR_PATIENCE = 7
-LEARNING_RATE = 1e-3
-WEIGHT_DECAY = 1e-4
+LEARNING_RATE = 2e-4
+WEIGHT_DECAY = 5e-4
 GRAD_CLIP = 1.0
 BASE_BATCH_SIZE = 64
 DATA_FILE = "nq.dbn"
@@ -260,7 +260,7 @@ class NQPredictor(nn.Module):
         self.bn1 = nn.BatchNorm1d(64)
         self.conv2 = nn.Conv1d(64, 128, kernel_size=3, padding=1)
         self.bn2 = nn.BatchNorm1d(128)
-        self.cnn_dropout = nn.Dropout(0.2)
+        self.cnn_dropout = nn.Dropout(0.4)
 
         # LSTM for temporal dependencies
         self.lstm = nn.LSTM(
@@ -268,14 +268,14 @@ class NQPredictor(nn.Module):
             hidden_size=128,
             num_layers=2,
             batch_first=True,
-            dropout=0.3,
+            dropout=0.4,
         )
 
         # Fully connected head
         self.fc = nn.Sequential(
             nn.Linear(128, 64),
             nn.ReLU(),
-            nn.Dropout(0.3),
+            nn.Dropout(0.5),
             nn.Linear(64, 1),
         )
 
@@ -309,7 +309,7 @@ def train_model(model, train_loader, val_loader, device, use_amp):
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=0.5, patience=LR_PATIENCE
     )
-    criterion = nn.MSELoss()
+    criterion = nn.HuberLoss(delta=1.0)
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     best_val_loss = float("inf")

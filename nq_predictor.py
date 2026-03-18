@@ -46,7 +46,7 @@ def box(title, lines, width=62):
 # ─────────────────────────────────────────────
 # Configuration
 # ─────────────────────────────────────────────
-LOOKBACK = 90  # bars to look back
+LOOKBACK = 120  # bars to look back
 HORIZON = 15  # bars to predict ahead
 TRAIN_RATIO = 0.80
 VAL_RATIO = 0.10  # of training portion
@@ -285,7 +285,7 @@ class NQPredictor(nn.Module):
         )
 
     def forward(self, x):
-        # x shape: (batch, seq_len=90, features)
+        # x shape: (batch, seq_len=120, features)
         # Conv1d expects (batch, channels, seq_len)
         x = x.permute(0, 2, 1)
 

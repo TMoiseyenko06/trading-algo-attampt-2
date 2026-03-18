@@ -454,7 +454,13 @@ def backtest_sltp(model, test_loader, device, use_amp, y_mean, y_std, test_paths
     sl_hits = 0
     expiry_exits = 0
 
+    cooldown = 0  # bars to skip while a trade is open
     for i in range(len(preds)):
+        if cooldown > 0:
+            cooldown -= 1
+            equity.append(equity[-1])
+            continue
+
         if abs(preds[i]) < TRADE_THRESHOLD:
             equity.append(equity[-1])
             continue
@@ -466,6 +472,7 @@ def backtest_sltp(model, test_loader, device, use_amp, y_mean, y_std, test_paths
         # Walk bar-by-bar through the price path
         path = test_paths[i]  # (horizon,) — price change at each bar vs entry
         exit_pnl = None
+        bars_held = len(path)  # default: held to expiry
 
         for bar in range(len(path)):
             move_in_direction = direction * path[bar]  # positive = favorable
@@ -474,11 +481,13 @@ def backtest_sltp(model, test_loader, device, use_amp, y_mean, y_std, test_paths
                 # TP hit — exit at TP level
                 exit_pnl = tp_level * NQ_MULTIPLIER
                 tp_hits += 1
+                bars_held = bar + 1
                 break
             elif move_in_direction <= -sl_level:
                 # SL hit — exit at SL level
                 exit_pnl = -sl_level * NQ_MULTIPLIER
                 sl_hits += 1
+                bars_held = bar + 1
                 break
 
         if exit_pnl is None:
@@ -486,6 +495,7 @@ def backtest_sltp(model, test_loader, device, use_amp, y_mean, y_std, test_paths
             exit_pnl = direction * path[-1] * NQ_MULTIPLIER
             expiry_exits += 1
 
+        cooldown = bars_held - 1  # skip remaining bars while trade is open
         equity.append(equity[-1] + exit_pnl)
         trade_pnls.append(exit_pnl)
         if direction > 0:
@@ -648,7 +658,13 @@ def backtest(model, test_loader, device, use_amp, y_mean=0.0, y_std=1.0, history
     long_pnls = []
     short_pnls = []
 
+    cooldown = 0  # bars to skip while a trade is open
     for i in range(len(preds)):
+        if cooldown > 0:
+            cooldown -= 1
+            equity.append(equity[-1])
+            continue
+
         if abs(preds[i]) >= TRADE_THRESHOLD:
             direction = np.sign(preds[i])
             pnl = direction * targets[i] * NQ_MULTIPLIER
@@ -658,6 +674,7 @@ def backtest(model, test_loader, device, use_amp, y_mean=0.0, y_std=1.0, history
                 long_pnls.append(pnl)
             else:
                 short_pnls.append(pnl)
+            cooldown = HORIZON - 1  # skip next bars while trade is open
         else:
             equity.append(equity[-1])
 

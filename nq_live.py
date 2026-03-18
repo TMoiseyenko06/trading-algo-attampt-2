@@ -1,7 +1,7 @@
 """
 NQ Futures Live Trading Module
 ===============================
-Fetches real-time 1-minute bars from TradingView, runs predictions through
+Fetches real-time 1-minute bars from Rithmic, runs predictions through
 the trained CNN+LSTM model, and manages trades with TP/SL/expiry logic.
 
 Trade entry/exit is printed to CLI (manual execution).
@@ -9,25 +9,28 @@ Trade entry/exit is printed to CLI (manual execution).
 Requires:
   - Trained checkpoint (nq_checkpoint.pt)
   - Training data (nq.dbn) for scaler calibration
-  - TradingView session token: TV_AUTH_TOKEN in .env
-  - pip install tvdatafeed
+  - Rithmic credentials in .env: RITHMIC_USER, RITHMIC_PASSWORD,
+    RITHMIC_SYSTEM_NAME, RITHMIC_URL
+  - pip install async_rithmic
 """
 
 import os
 import sys
 import time
+import asyncio
 import logging
 import argparse
-from datetime import datetime
+from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
 
 from dotenv import load_dotenv
 
 import numpy as np
+import pandas as pd
 import torch
 from sklearn.preprocessing import StandardScaler
-from tvDatafeed import TvDatafeed, Interval
+from async_rithmic import RithmicClient, TimeBarType
 
 # Reuse model, features, and data loading from the training module
 from nq_predictor import (
@@ -44,7 +47,7 @@ from nq_predictor import (
     TRAIN_RATIO,
 )
 
-# How many raw bars to fetch from TradingView.
+# How many raw bars to fetch.
 # build_features() needs ~60 bars of warm-up (SMA60 is the longest rolling window),
 # plus LOOKBACK (90) bars of usable features = 150 minimum. Add buffer.
 FETCH_BARS = 200
@@ -107,84 +110,192 @@ def calibrate_scaler(data_file, num_features):
 
 
 # ─────────────────────────────────────────────
-# TradingView data
+# Rithmic data
 # ─────────────────────────────────────────────
-def _make_tv():
-    """Create a fresh TvDatafeed instance with the session token and a longer
-    websocket timeout (the default 5 s is too aggressive)."""
-    token = os.environ.get("TV_AUTH_TOKEN")
-    if not token:
-        print("ERROR: Set TV_AUTH_TOKEN in your .env file.")
-        print("  1. Log into tradingview.com in your browser")
-        print("  2. DevTools (F12) → Application → Cookies → sessionid")
-        print("  3. Copy the value into .env as TV_AUTH_TOKEN=<value>")
+def _get_rithmic_env():
+    """Read and validate Rithmic credentials from environment."""
+    user = os.environ.get("RITHMIC_USER")
+    password = os.environ.get("RITHMIC_PASSWORD")
+    system_name = os.environ.get("RITHMIC_SYSTEM_NAME")
+    url = os.environ.get("RITHMIC_URL")
+
+    if not all([user, password, system_name, url]):
+        print("ERROR: Missing Rithmic credentials in .env file.")
+        print("  Required variables:")
+        print("    RITHMIC_USER=your_username")
+        print("    RITHMIC_PASSWORD=your_password")
+        print("    RITHMIC_SYSTEM_NAME=Rithmic Paper Trading")
+        print("    RITHMIC_URL=rituz00100.rithmic.com:443")
         sys.exit(1)
 
-    tv = TvDatafeed()
-    tv.token = token
-    # Bump the websocket timeout from the default 5 s to 30 s
-    TvDatafeed._TvDatafeed__ws_timeout = 30
-    return tv
+    return user, password, system_name, url
 
 
-def connect_tv():
-    """Connect to TradingView using session token from environment."""
-    print("  Connecting to TradingView with session token...")
-    tv = _make_tv()
-    return tv
+def _make_client():
+    """Create a new RithmicClient from env credentials."""
+    user, password, system_name, url = _get_rithmic_env()
+    return RithmicClient(
+        user=user,
+        password=password,
+        system_name=system_name,
+        app_name="nq_live_trading",
+        app_version="1.0",
+        url=url,
+    )
 
 
-def _tv_call(tv, fn, max_retries=3, **kwargs):
-    """Call a TvDatafeed method with automatic reconnect on failure.
+async def _connect_and_resolve(symbol, exchange):
+    """Connect to Rithmic and resolve front-month contract. Returns (client, security_code)."""
+    client = _make_client()
+    await client.connect()
 
-    If the websocket drops (``Connection to remote host was lost``), we build
-    a brand-new TvDatafeed instance and retry up to *max_retries* times with
-    exponential back-off (2 s, 4 s, 8 s).
-    """
+    # Resolve front-month contract (e.g., "NQ" -> "NQM6")
+    security_code = await client.get_front_month_contract(symbol, exchange)
+    print(f"  Resolved front-month contract: {security_code}")
+    return client, security_code
+
+
+async def _fetch_bars_async(client, security_code, exchange, n_bars=FETCH_BARS):
+    """Fetch recent 1-minute bars from Rithmic history."""
+    end_time = datetime.now()
+    # Request extra bars to account for gaps (weekends, holidays, off-hours)
+    start_time = end_time - timedelta(minutes=n_bars * 3)
+
+    bars = await client.get_historical_time_bars(
+        security_code,
+        exchange,
+        start_time,
+        end_time,
+        TimeBarType.MINUTE_BAR,
+        1,
+    )
+
+    if not bars:
+        return None
+
+    # Convert bar dicts to DataFrame
+    rows = []
+    for bar in bars:
+        # async_rithmic bar keys may vary — handle common naming conventions
+        row = {
+            "open": bar.get("open_price", bar.get("open", 0)),
+            "high": bar.get("high_price", bar.get("high", 0)),
+            "low": bar.get("low_price", bar.get("low", 0)),
+            "close": bar.get("close_price", bar.get("close", 0)),
+            "volume": bar.get("volume", 0),
+        }
+        rows.append(row)
+
+    df = pd.DataFrame(rows)
+
+    # Keep only the last n_bars
+    if len(df) > n_bars:
+        df = df.iloc[-n_bars:]
+
+    df = df.reset_index(drop=True)
+    return df
+
+
+async def _fetch_latest_price_async(client, security_code, exchange):
+    """Fetch the most recent close price from Rithmic."""
+    end_time = datetime.now()
+    start_time = end_time - timedelta(minutes=5)
+
+    bars = await client.get_historical_time_bars(
+        security_code,
+        exchange,
+        start_time,
+        end_time,
+        TimeBarType.MINUTE_BAR,
+        1,
+    )
+
+    if not bars:
+        return None
+
+    last_bar = bars[-1]
+    return float(last_bar.get("close_price", last_bar.get("close", 0)))
+
+
+def connect_rithmic(symbol, exchange):
+    """Connect to Rithmic and resolve the front-month contract (sync wrapper)."""
+    print("  Connecting to Rithmic...")
+    client, security_code = asyncio.run(_connect_and_resolve(symbol, exchange))
+    return client, security_code
+
+
+async def _reconnect_and_fetch_bars(symbol, exchange, n_bars):
+    """Reconnect and fetch bars in one async call."""
+    client, security_code = await _connect_and_resolve(symbol, exchange)
+    df = await _fetch_bars_async(client, security_code, exchange, n_bars)
+    return client, security_code, df
+
+
+async def _reconnect_and_fetch_price(symbol, exchange):
+    """Reconnect and fetch latest price in one async call."""
+    client, security_code = await _connect_and_resolve(symbol, exchange)
+    price = await _fetch_latest_price_async(client, security_code, exchange)
+    return client, security_code, price
+
+
+def fetch_bars(client, security_code, symbol, exchange, n_bars=FETCH_BARS, max_retries=3):
+    """Fetch recent 1-minute bars from Rithmic (with auto-reconnect)."""
     for attempt in range(1, max_retries + 1):
         try:
-            result = fn(**kwargs)
-            return tv, result
+            df = asyncio.run(_fetch_bars_async(client, security_code, exchange, n_bars))
+            if df is not None and not df.empty:
+                return client, security_code, df
         except Exception as e:
-            logger.warning(f"  TV call failed (attempt {attempt}/{max_retries}): {e}")
-            if attempt < max_retries:
-                wait = 2 ** attempt
-                print(f"  Reconnecting in {wait}s...")
-                time.sleep(wait)
-                tv = _make_tv()
-            else:
-                print(f"  TV call failed after {max_retries} attempts.")
-                return tv, None
+            logger.warning(f"  Rithmic fetch failed (attempt {attempt}/{max_retries}): {e}")
+
+        if attempt < max_retries:
+            wait = 2 ** attempt
+            print(f"  Reconnecting in {wait}s...")
+            time.sleep(wait)
+            try:
+                client, security_code, df = asyncio.run(
+                    _reconnect_and_fetch_bars(symbol, exchange, n_bars)
+                )
+                if df is not None and not df.empty:
+                    return client, security_code, df
+            except Exception as e:
+                logger.warning(f"  Reconnect failed: {e}")
+
+    print(f"  Rithmic fetch failed after {max_retries} attempts.")
+    return client, security_code, None
 
 
-def fetch_bars(tv, symbol, exchange, n_bars=FETCH_BARS):
-    """Fetch recent 1-minute bars from TradingView (with auto-reconnect)."""
-    tv, df = _tv_call(
-        tv,
-        tv.get_hist,
-        symbol=symbol,
-        exchange=exchange,
-        interval=Interval.in_1_minute,
-        n_bars=n_bars,
-    )
-    if df is None or (hasattr(df, "empty") and df.empty):
-        return tv, None
+def fetch_latest_price(client, security_code, symbol, exchange, max_retries=3):
+    """Fetch the most recent close price from Rithmic (with auto-reconnect)."""
+    for attempt in range(1, max_retries + 1):
+        try:
+            price = asyncio.run(
+                _fetch_latest_price_async(client, security_code, exchange)
+            )
+            if price is not None:
+                return client, security_code, price
+        except Exception as e:
+            logger.warning(f"  Price fetch failed (attempt {attempt}/{max_retries}): {e}")
 
-    # tvDatafeed returns columns: open, high, low, close, volume
-    df.columns = [c.lower() for c in df.columns]
-    required = ["open", "high", "low", "close", "volume"]
-    for col in required:
-        if col not in df.columns:
-            print(f"  WARNING: Missing column '{col}' in TradingView data")
-            return tv, None
+        if attempt < max_retries:
+            wait = 2 ** attempt
+            print(f"  Reconnecting in {wait}s...")
+            time.sleep(wait)
+            try:
+                client, security_code, price = asyncio.run(
+                    _reconnect_and_fetch_price(symbol, exchange)
+                )
+                if price is not None:
+                    return client, security_code, price
+            except Exception as e:
+                logger.warning(f"  Reconnect failed: {e}")
 
-    return tv, df[required].copy()
+    print(f"  Price fetch failed after {max_retries} attempts.")
+    return client, security_code, None
 
 
 def load_csv(path):
     """Load OHLCV data from a TradingView-exported CSV file."""
-    import pandas as pd
-
     df = pd.read_csv(path)
     df.columns = [c.strip().lower() for c in df.columns]
     # TV uses various volume column names — try to find it
@@ -204,21 +315,6 @@ def load_csv(path):
             print(f"  Found columns: {list(df.columns)}")
             sys.exit(1)
     return df[required].copy()
-
-
-def fetch_latest_price(tv, symbol, exchange):
-    """Fetch the most recent close price (with auto-reconnect)."""
-    tv, df = _tv_call(
-        tv,
-        tv.get_hist,
-        symbol=symbol,
-        exchange=exchange,
-        interval=Interval.in_1_minute,
-        n_bars=2,
-    )
-    if df is None or (hasattr(df, "empty") and df.empty):
-        return tv, None
-    return tv, float(df["close"].iloc[-1])
 
 
 # ─────────────────────────────────────────────
@@ -257,9 +353,9 @@ def predict(model, device, scaler, y_mean, y_std, num_features, raw_df):
 # ─────────────────────────────────────────────
 # Trade monitoring
 # ─────────────────────────────────────────────
-def monitor_trade(tv, symbol, exchange, direction, entry_price, tp_level, sl_level,
-                  poll_interval):
-    """Poll price until TP, SL, or expiry (HORIZON bars). Returns (tv, exit_info)."""
+def monitor_trade(client, security_code, symbol, exchange,
+                  direction, entry_price, tp_level, sl_level, poll_interval):
+    """Poll price until TP, SL, or expiry (HORIZON bars). Returns (client, security_code, exit_info)."""
     bars_elapsed = 0
     last_bar_time = datetime.now()
 
@@ -269,7 +365,9 @@ def monitor_trade(tv, symbol, exchange, direction, entry_price, tp_level, sl_lev
     while bars_elapsed < HORIZON:
         time.sleep(poll_interval)
 
-        tv, price = fetch_latest_price(tv, symbol, exchange)
+        client, security_code, price = fetch_latest_price(
+            client, security_code, symbol, exchange
+        )
         if price is None:
             print(f"  [{timestamp()}] Price fetch failed, retrying...")
             continue
@@ -294,7 +392,7 @@ def monitor_trade(tv, symbol, exchange, direction, entry_price, tp_level, sl_lev
 
         # Check TP
         if move_in_direction >= tp_level:
-            return tv, {
+            return client, security_code, {
                 "reason": "TP HIT",
                 "exit_price": price,
                 "pnl_points": tp_level,
@@ -304,7 +402,7 @@ def monitor_trade(tv, symbol, exchange, direction, entry_price, tp_level, sl_lev
 
         # Check SL
         if move_in_direction <= -sl_level:
-            return tv, {
+            return client, security_code, {
                 "reason": "SL HIT",
                 "exit_price": price,
                 "pnl_points": -sl_level,
@@ -313,12 +411,14 @@ def monitor_trade(tv, symbol, exchange, direction, entry_price, tp_level, sl_lev
             }
 
     # Expiry — fetch final price
-    tv, price = fetch_latest_price(tv, symbol, exchange)
+    client, security_code, price = fetch_latest_price(
+        client, security_code, symbol, exchange
+    )
     if price is None:
         price = entry_price  # fallback
     move = price - entry_price
     pnl_points = direction * move
-    return tv, {
+    return client, security_code, {
         "reason": "EXPIRY",
         "exit_price": price,
         "pnl_points": pnl_points,
@@ -352,7 +452,7 @@ def run(args):
     # Calibrate scaler
     scaler = calibrate_scaler(args.data_file, num_features)
 
-    # CSV mode: single prediction, no TradingView needed
+    # CSV mode: single prediction, no Rithmic needed
     if args.csv:
         banner("NQ PREDICTION — CSV MODE")
         raw_df = load_csv(args.csv)
@@ -382,8 +482,8 @@ def run(args):
             print(f"  ** Above threshold — would ENTER {direction} **")
         return
 
-    # Connect to TradingView
-    tv = connect_tv()
+    # Connect to Rithmic
+    client, security_code = connect_rithmic(args.symbol, args.exchange)
 
     # Session stats
     total_trades = 0
@@ -396,7 +496,9 @@ def run(args):
     try:
         while True:
             # 1. Fetch recent bars
-            tv, raw_df = fetch_bars(tv, args.symbol, args.exchange)
+            client, security_code, raw_df = fetch_bars(
+                client, security_code, args.symbol, args.exchange
+            )
             if raw_df is None:
                 print(f"  [{timestamp()}] Data fetch failed, retrying in 60s...")
                 time.sleep(60)
@@ -439,8 +541,8 @@ def run(args):
             print(f"  Max bars:      {HORIZON}")
 
             # 6. Monitor trade
-            tv, result = monitor_trade(
-                tv, args.symbol, args.exchange,
+            client, security_code, result = monitor_trade(
+                client, security_code, args.symbol, args.exchange,
                 direction, entry_price, tp_level, sl_level,
                 args.poll_interval,
             )
@@ -484,7 +586,7 @@ def run(args):
 # ─────────────────────────────────────────────
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="NQ Live Trading — CNN+LSTM predictions with TradingView data"
+        description="NQ Live Trading — CNN+LSTM predictions with Rithmic data"
     )
     parser.add_argument("--tp-pct", type=float, default=1.0,
                         help="TP as fraction of predicted move (default: 1.0)")
@@ -499,11 +601,11 @@ def parse_args():
     parser.add_argument("--data-file", type=str, default=DATA_FILE,
                         help=f"Training data for scaler calibration (default: {DATA_FILE})")
     parser.add_argument("--csv", type=str, default=None,
-                        help="Path to CSV file with OHLCV data (bypasses TradingView)")
-    parser.add_argument("--symbol", type=str, default="NQ1!",
-                        help="TradingView symbol (default: NQ1!)")
+                        help="Path to CSV file with OHLCV data (bypasses Rithmic)")
+    parser.add_argument("--symbol", type=str, default="NQ",
+                        help="Rithmic root symbol (default: NQ)")
     parser.add_argument("--exchange", type=str, default="CME",
-                        help="TradingView exchange (default: CME)")
+                        help="Exchange (default: CME)")
     return parser.parse_args()
 
 

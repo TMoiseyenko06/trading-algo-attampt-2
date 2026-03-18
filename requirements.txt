@@ -5,5 +5,5 @@ numpy
 scipy
 scikit-learn
 matplotlib
-tradingview-datafeed
+async_rithmic
 python-dotenv

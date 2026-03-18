@@ -229,23 +229,28 @@ class NQDataset(Dataset):
 
 
 def create_windows(features_df, close_prices, lookback, horizon):
-    """Create sliding windows of features and corresponding targets."""
+    """Create sliding windows of features and corresponding targets.
+    Also returns bar-by-bar price paths for SL/TP simulation."""
     feat_values = features_df.values
     close_values = close_prices.values
     n = len(feat_values)
 
     X_list = []
     y_list = []
+    paths_list = []
 
     for i in range(lookback, n - horizon):
         X_list.append(feat_values[i - lookback : i])
         # Target: price change over next `horizon` bars
         y_list.append(close_values[i + horizon] - close_values[i])
+        # Bar-by-bar path: price change at each bar relative to entry
+        paths_list.append(close_values[i + 1 : i + horizon + 1] - close_values[i])
 
     X = np.array(X_list, dtype=np.float32)
     y = np.array(y_list, dtype=np.float32)
+    paths = np.array(paths_list, dtype=np.float32)  # (n_samples, horizon)
 
-    return X, y
+    return X, y, paths
 
 
 # ─────────────────────────────────────────────
@@ -411,6 +416,172 @@ def compute_prediction_entropy(preds, n_bins=50):
     hist = hist[hist > 0]  # remove zeros for log
     hist = hist / hist.sum()  # normalize to probability
     return scipy_entropy(hist, base=2)
+
+
+def backtest_sltp(model, test_loader, device, use_amp, y_mean, y_std, test_paths, tp_pct, sl_pct):
+    """Backtest with stop-loss and take-profit levels based on prediction magnitude.
+
+    TP = abs(prediction) * tp_pct
+    SL = TP * sl_pct
+
+    Walks bar-by-bar through each 15-bar window to check if TP or SL is hit first.
+    If neither is hit, the trade exits at the final bar (hold to expiry).
+    """
+    model.eval()
+    all_preds = []
+    all_targets = []
+
+    with torch.no_grad():
+        for X_batch, y_batch in test_loader:
+            X_batch = X_batch.to(device)
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                preds = model(X_batch)
+            all_preds.append(preds.cpu().numpy())
+            all_targets.append(y_batch.numpy())
+
+    preds = np.concatenate(all_preds)
+    targets = np.concatenate(all_targets)
+
+    # Denormalize predictions back to real NQ points
+    preds = preds * y_std + y_mean
+
+    # ── Simulate SL/TP trades ──
+    equity = [0.0]
+    trade_pnls = []
+    long_pnls = []
+    short_pnls = []
+    tp_hits = 0
+    sl_hits = 0
+    expiry_exits = 0
+
+    for i in range(len(preds)):
+        if abs(preds[i]) < TRADE_THRESHOLD:
+            equity.append(equity[-1])
+            continue
+
+        direction = np.sign(preds[i])
+        tp_level = abs(preds[i]) * tp_pct   # TP in points
+        sl_level = tp_level * sl_pct         # SL in points
+
+        # Walk bar-by-bar through the price path
+        path = test_paths[i]  # (horizon,) — price change at each bar vs entry
+        exit_pnl = None
+
+        for bar in range(len(path)):
+            move_in_direction = direction * path[bar]  # positive = favorable
+
+            if move_in_direction >= tp_level:
+                # TP hit — exit at TP level
+                exit_pnl = tp_level * NQ_MULTIPLIER
+                tp_hits += 1
+                break
+            elif move_in_direction <= -sl_level:
+                # SL hit — exit at SL level
+                exit_pnl = -sl_level * NQ_MULTIPLIER
+                sl_hits += 1
+                break
+
+        if exit_pnl is None:
+            # Neither hit — exit at final bar (hold to expiry)
+            exit_pnl = direction * path[-1] * NQ_MULTIPLIER
+            expiry_exits += 1
+
+        equity.append(equity[-1] + exit_pnl)
+        trade_pnls.append(exit_pnl)
+        if direction > 0:
+            long_pnls.append(exit_pnl)
+        else:
+            short_pnls.append(exit_pnl)
+
+    equity = np.array(equity)
+    trade_pnls = np.array(trade_pnls) if trade_pnls else np.array([0.0])
+    long_pnls = np.array(long_pnls) if long_pnls else np.array([0.0])
+    short_pnls = np.array(short_pnls) if short_pnls else np.array([0.0])
+
+    total_trades = len(trade_pnls)
+    wins = np.sum(trade_pnls > 0)
+    losses = np.sum(trade_pnls < 0)
+    breakeven = np.sum(trade_pnls == 0)
+    win_rate = (wins / total_trades * 100) if total_trades > 0 else 0
+    total_pnl = equity[-1]
+
+    avg_win = np.mean(trade_pnls[trade_pnls > 0]) if wins > 0 else 0
+    avg_loss = np.mean(trade_pnls[trade_pnls < 0]) if losses > 0 else 0
+    largest_win = np.max(trade_pnls) if total_trades > 0 else 0
+    largest_loss = np.min(trade_pnls) if total_trades > 0 else 0
+    profit_factor = abs(np.sum(trade_pnls[trade_pnls > 0]) / np.sum(trade_pnls[trade_pnls < 0])) if losses > 0 and np.sum(trade_pnls[trade_pnls < 0]) != 0 else float("inf")
+    expectancy = np.mean(trade_pnls) if total_trades > 0 else 0
+
+    # Max drawdown
+    peak = np.maximum.accumulate(equity)
+    drawdown = peak - equity
+    max_dd = np.max(drawdown)
+    max_dd_pct = (max_dd / np.max(peak) * 100) if np.max(peak) > 0 else 0
+
+    # Sharpe
+    if total_trades > 1 and np.std(trade_pnls) > 0:
+        sharpe = np.mean(trade_pnls) / np.std(trade_pnls) * np.sqrt(252)
+    else:
+        sharpe = 0.0
+
+    # Long/short breakdown
+    long_total = len(long_pnls)
+    long_wins = np.sum(long_pnls > 0)
+    long_wr = (long_wins / long_total * 100) if long_total > 0 else 0
+    long_pnl_total = np.sum(long_pnls)
+
+    short_total = len(short_pnls)
+    short_wins = np.sum(short_pnls > 0)
+    short_wr = (short_wins / short_total * 100) if short_total > 0 else 0
+    short_pnl_total = np.sum(short_pnls)
+
+    # ── Print Results ──
+    box("SL/TP BACKTEST", [
+        f"TP:  {tp_pct*100:.0f}% of prediction  |  SL:  {sl_pct*100:.0f}% of TP",
+        f"Trade Threshold:           {TRADE_THRESHOLD} pts  |  NQ Multiplier: ${NQ_MULTIPLIER:.0f}/pt",
+        "---",
+        f"Total Trades:              {total_trades:,}",
+        f"  Wins:                    {int(wins):,}",
+        f"  Losses:                  {int(losses):,}",
+        f"  Breakeven:               {int(breakeven):,}",
+        f"Win Rate:                  {win_rate:.1f}%",
+        "---",
+        f"Exit Reasons:",
+        f"  TP Hit:                  {tp_hits:,}  ({tp_hits/total_trades*100:.1f}%)" if total_trades > 0 else f"  TP Hit:                  0",
+        f"  SL Hit:                  {sl_hits:,}  ({sl_hits/total_trades*100:.1f}%)" if total_trades > 0 else f"  SL Hit:                  0",
+        f"  Held to Expiry:          {expiry_exits:,}  ({expiry_exits/total_trades*100:.1f}%)" if total_trades > 0 else f"  Held to Expiry:          0",
+        "---",
+        f"Total P&L:                 ${total_pnl:>12,.2f}",
+        f"Avg Win:                   ${avg_win:>12,.2f}",
+        f"Avg Loss:                  ${avg_loss:>12,.2f}",
+        f"Largest Win:               ${largest_win:>12,.2f}",
+        f"Largest Loss:              ${largest_loss:>12,.2f}",
+        f"Expectancy (per trade):    ${expectancy:>12,.2f}",
+        f"Profit Factor:             {profit_factor:>12.2f}",
+        "---",
+        f"Max Drawdown:              ${max_dd:>12,.2f}  ({max_dd_pct:.1f}%)",
+        f"Annualized Sharpe:         {sharpe:>12.3f}",
+    ])
+
+    box("LONG vs SHORT BREAKDOWN (SL/TP)", [
+        f"{'':28} {'Long':>15} {'Short':>15}",
+        f"{'Trades:':28} {long_total:>15,} {short_total:>15,}",
+        f"{'Win Rate:':28} {long_wr:>14.1f}% {short_wr:>14.1f}%",
+        f"{'Total P&L:':28} ${long_pnl_total:>13,.2f} ${short_pnl_total:>13,.2f}",
+    ])
+
+    # ── Equity Curve Plot ──
+    fig, ax = plt.subplots(figsize=(12, 5))
+    ax.plot(equity, linewidth=0.8, color="#2196F3")
+    ax.fill_between(range(len(equity)), equity, 0, alpha=0.1, color="#2196F3")
+    ax.set_title(f"SL/TP Equity Curve  (TP={tp_pct*100:.0f}%, SL={sl_pct*100:.0f}% of TP)")
+    ax.set_xlabel("Bar")
+    ax.set_ylabel("Cumulative P&L ($)")
+    ax.axhline(y=0, color="gray", linestyle="--", linewidth=0.5)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig("backtest_sltp.png", dpi=150)
+    print(f"\nPlot saved to backtest_sltp.png")
 
 
 def backtest(model, test_loader, device, use_amp, y_mean=0.0, y_std=1.0, history=None):
@@ -680,6 +851,16 @@ def parse_args():
         "--backtest-only", action="store_true",
         help="Skip training and only run backtest using saved checkpoint.",
     )
+    parser.add_argument(
+        "--tp", type=float, default=None, metavar="PCT",
+        help="Take-profit as a fraction of the prediction (e.g. 0.5 = 50%%). "
+             "Requires --sl. Runs SL/TP backtest mode.",
+    )
+    parser.add_argument(
+        "--sl", type=float, default=None, metavar="PCT",
+        help="Stop-loss as a fraction of the TP level (e.g. 0.5 = 50%% of TP). "
+             "Requires --tp.",
+    )
     return parser.parse_args()
 
 
@@ -710,7 +891,7 @@ def main():
     close_prices = df["close"].loc[features_df.index]
 
     # Create windowed samples
-    X, y = create_windows(features_df, close_prices, LOOKBACK, HORIZON)
+    X, y, paths = create_windows(features_df, close_prices, LOOKBACK, HORIZON)
 
     # Target distribution info
     tgt_up = np.sum(y > 0)
@@ -721,6 +902,7 @@ def main():
     split_idx = int(len(y) * TRAIN_RATIO)
     X_train_full, X_test = X[:split_idx], X[split_idx:]
     y_train_full, y_test = y[:split_idx], y[split_idx:]
+    test_paths = paths[split_idx:]  # bar-by-bar paths for SL/TP backtest
 
     # Validation split from training data
     val_split = int(len(X_train_full) * (1 - VAL_RATIO))
@@ -858,6 +1040,16 @@ def main():
 
     # Backtest (denormalize predictions back to real NQ points)
     backtest(model, test_loader, device, use_amp, y_mean=y_mean, y_std=y_std, history=history)
+
+    # SL/TP backtest (if requested)
+    if args.tp is not None or args.sl is not None:
+        if args.tp is None or args.sl is None:
+            print("\nERROR: --tp and --sl must both be specified together.")
+            sys.exit(1)
+        backtest_sltp(model, test_loader, device, use_amp,
+                      y_mean=y_mean, y_std=y_std,
+                      test_paths=test_paths,
+                      tp_pct=args.tp, sl_pct=args.sl)
 
 
 if __name__ == "__main__":

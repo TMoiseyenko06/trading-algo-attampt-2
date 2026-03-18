@@ -228,13 +228,9 @@ class NQDataset(Dataset):
         return self.X[idx], self.y[idx]
 
 
-def create_windows(features_df, close_prices, lookback, horizon, stride=1):
+def create_windows(features_df, close_prices, lookback, horizon):
     """Create sliding windows of features and corresponding targets.
-    Also returns bar-by-bar price paths for SL/TP simulation.
-
-    stride: step size between windows. Use stride=horizon for non-overlapping
-            windows (one trade at a time), stride=1 for maximum overlap.
-    """
+    Also returns bar-by-bar price paths for SL/TP simulation."""
     feat_values = features_df.values
     close_values = close_prices.values
     n = len(feat_values)
@@ -243,7 +239,7 @@ def create_windows(features_df, close_prices, lookback, horizon, stride=1):
     y_list = []
     paths_list = []
 
-    for i in range(lookback, n - horizon, stride):
+    for i in range(lookback, n - horizon):
         X_list.append(feat_values[i - lookback : i])
         # Target: price change over next `horizon` bars
         y_list.append(close_values[i + horizon] - close_values[i])
@@ -912,7 +908,7 @@ def main():
     close_prices = df["close"].loc[features_df.index]
 
     # Create windowed samples
-    X, y, paths = create_windows(features_df, close_prices, LOOKBACK, HORIZON, stride=HORIZON)
+    X, y, paths = create_windows(features_df, close_prices, LOOKBACK, HORIZON)
 
     # Target distribution info
     tgt_up = np.sum(y > 0)

@@ -418,7 +418,7 @@ def compute_prediction_entropy(preds, n_bins=50):
     return scipy_entropy(hist, base=2)
 
 
-def backtest_sltp(model, test_loader, device, use_amp, y_mean, y_std, test_paths, tp_pct, sl_pct):
+def backtest_sltp(model, test_loader, device, use_amp, y_mean, y_std, test_paths, tp_pct, sl_pct, threshold=TRADE_THRESHOLD):
     """Backtest with stop-loss and take-profit levels based on prediction magnitude.
 
     TP = abs(prediction) * tp_pct
@@ -461,7 +461,7 @@ def backtest_sltp(model, test_loader, device, use_amp, y_mean, y_std, test_paths
             equity.append(equity[-1])
             continue
 
-        if abs(preds[i]) < TRADE_THRESHOLD:
+        if abs(preds[i]) < threshold:
             equity.append(equity[-1])
             continue
 
@@ -548,7 +548,7 @@ def backtest_sltp(model, test_loader, device, use_amp, y_mean, y_std, test_paths
     # ── Print Results ──
     box("SL/TP BACKTEST", [
         f"TP:  {tp_pct*100:.0f}% of prediction  |  SL:  {sl_pct*100:.0f}% of TP",
-        f"Trade Threshold:           {TRADE_THRESHOLD} pts  |  NQ Multiplier: ${NQ_MULTIPLIER:.0f}/pt",
+        f"Trade Threshold:           {threshold} pts  |  NQ Multiplier: ${NQ_MULTIPLIER:.0f}/pt",
         "---",
         f"Total Trades:              {total_trades:,}",
         f"  Wins:                    {int(wins):,}",
@@ -594,7 +594,7 @@ def backtest_sltp(model, test_loader, device, use_amp, y_mean, y_std, test_paths
     print(f"\nPlot saved to backtest_sltp.png")
 
 
-def backtest(model, test_loader, device, use_amp, y_mean=0.0, y_std=1.0, history=None):
+def backtest(model, test_loader, device, use_amp, y_mean=0.0, y_std=1.0, history=None, threshold=TRADE_THRESHOLD):
     """Run predictions on test set and compute comprehensive metrics."""
     model.eval()
     all_preds = []
@@ -665,7 +665,7 @@ def backtest(model, test_loader, device, use_amp, y_mean=0.0, y_std=1.0, history
             equity.append(equity[-1])
             continue
 
-        if abs(preds[i]) >= TRADE_THRESHOLD:
+        if abs(preds[i]) >= threshold:
             direction = np.sign(preds[i])
             pnl = direction * targets[i] * NQ_MULTIPLIER
             equity.append(equity[-1] + pnl)
@@ -766,7 +766,7 @@ def backtest(model, test_loader, device, use_amp, y_mean=0.0, y_std=1.0, history
     ])
 
     box("TRADING PERFORMANCE", [
-        f"Trade Threshold:           {TRADE_THRESHOLD} pts  |  NQ Multiplier: ${NQ_MULTIPLIER:.0f}/pt",
+        f"Trade Threshold:           {threshold} pts  |  NQ Multiplier: ${NQ_MULTIPLIER:.0f}/pt",
         "---",
         f"Total Trades:              {total_trades:,}",
         f"  Wins:                    {int(wins):,}",
@@ -867,6 +867,10 @@ def parse_args():
     parser.add_argument(
         "--backtest-only", action="store_true",
         help="Skip training and only run backtest using saved checkpoint.",
+    )
+    parser.add_argument(
+        "--threshold", type=float, default=TRADE_THRESHOLD,
+        help=f"Min predicted move (pts) to enter a trade (default: {TRADE_THRESHOLD})",
     )
     parser.add_argument(
         "--tp", type=float, default=None, metavar="PCT",
@@ -1056,7 +1060,7 @@ def main():
         print(f"\nCheckpoint saved to {CHECKPOINT_FILE}")
 
     # Backtest (denormalize predictions back to real NQ points)
-    backtest(model, test_loader, device, use_amp, y_mean=y_mean, y_std=y_std, history=history)
+    backtest(model, test_loader, device, use_amp, y_mean=y_mean, y_std=y_std, history=history, threshold=args.threshold)
 
     # SL/TP backtest (if requested)
     if args.tp is not None or args.sl is not None:
@@ -1066,7 +1070,8 @@ def main():
         backtest_sltp(model, test_loader, device, use_amp,
                       y_mean=y_mean, y_std=y_std,
                       test_paths=test_paths,
-                      tp_pct=args.tp, sl_pct=args.sl)
+                      tp_pct=args.tp, sl_pct=args.sl,
+                      threshold=args.threshold)
 
 
 if __name__ == "__main__":

@@ -19,6 +19,8 @@ import time
 import argparse
 from datetime import datetime
 
+from dotenv import load_dotenv
+
 import numpy as np
 import torch
 from sklearn.preprocessing import StandardScaler
@@ -263,6 +265,7 @@ def monitor_trade(tv, symbol, exchange, direction, entry_price, tp_level, sl_lev
 # Main loop
 # ─────────────────────────────────────────────
 def run(args):
+    load_dotenv()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     banner("NQ LIVE TRADING MODULE")

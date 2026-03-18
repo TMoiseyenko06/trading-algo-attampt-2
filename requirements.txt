@@ -6,3 +6,4 @@ scipy
 scikit-learn
 matplotlib
 tvdatafeed
+python-dotenv

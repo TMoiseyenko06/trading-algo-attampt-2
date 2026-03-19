@@ -28,8 +28,10 @@ from dotenv import load_dotenv
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn as nn
 import databento as db
 from sklearn.preprocessing import StandardScaler
+from collections import deque
 
 # Reuse model, features, and data loading from the training module
 from nq_predictor import (
@@ -142,6 +144,154 @@ def calibrate_scaler(data_file, num_features):
     print(f"  Scaler calibrated on {len(train_features):,} feature rows "
           f"(~{split_idx:,} training windows).")
     return scaler
+
+
+# ─────────────────────────────────────────────
+# Online learning from live data
+# ─────────────────────────────────────────────
+ONLINE_LR = 1e-5               # Very low LR for fine-tuning (avoid catastrophic forgetting)
+ONLINE_GRAD_CLIP = 0.5         # Tighter gradient clipping for stability
+ONLINE_MIN_SAMPLES = 8         # Minimum replay buffer size before training
+ONLINE_MAX_SAMPLES = 512       # Max replay buffer size (rolling window of recent data)
+ONLINE_TRAIN_EPOCHS = 3        # Gradient steps per online training round
+ONLINE_SAVE_INTERVAL = 10      # Save checkpoint every N training rounds
+
+
+class OnlineLearner:
+    """Incrementally fine-tunes the model on live trade outcomes.
+
+    After each trade's HORIZON window expires, we know the actual price move.
+    This class:
+      1. Stores (features_window, actual_target) pairs in a replay buffer
+      2. Periodically runs a few gradient steps to fine-tune the model
+      3. Saves updated checkpoints
+    """
+
+    def __init__(self, model, device, scaler, y_mean, y_std, num_features,
+                 checkpoint_path):
+        self._model = model
+        self._device = device
+        self._scaler = scaler
+        self._y_mean = y_mean
+        self._y_std = y_std
+        self._num_features = num_features
+        self._checkpoint_path = checkpoint_path
+
+        # Replay buffer: stores (X_window, y_target) tuples
+        # X_window: np.array (LOOKBACK, num_features) — raw features (pre-scaler)
+        # y_target: float — actual NQ point move over HORIZON bars
+        self._buffer = deque(maxlen=ONLINE_MAX_SAMPLES)
+
+        # Optimizer for fine-tuning (low LR, no weight decay to preserve learned features)
+        self._optimizer = torch.optim.AdamW(
+            model.parameters(), lr=ONLINE_LR, weight_decay=1e-5
+        )
+        self._criterion = nn.HuberLoss(delta=1.0)
+        self._train_rounds = 0
+        self._total_samples = 0
+
+    def record_outcome(self, raw_df, entry_idx, actual_move):
+        """Record a completed trade outcome as a training sample.
+
+        Args:
+            raw_df: The bar DataFrame at the time of trade entry
+            entry_idx: Not used (kept for API clarity) — we use the last LOOKBACK bars
+            actual_move: The actual close[t+HORIZON] - close[t] in NQ points
+        """
+        features_df = build_features(raw_df)
+        if len(features_df) < LOOKBACK:
+            return
+
+        # Extract the feature window that was used for prediction
+        window = features_df.iloc[-LOOKBACK:].values.astype(np.float32)
+        self._buffer.append((window, float(actual_move)))
+        self._total_samples += 1
+
+        buf_size = len(self._buffer)
+        if buf_size >= ONLINE_MIN_SAMPLES:
+            self._train_step()
+
+    def _train_step(self):
+        """Run a few gradient steps on the replay buffer."""
+        self._model.train()
+
+        # Freeze batch norm layers to prevent distribution shift
+        for module in self._model.modules():
+            if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d)):
+                module.eval()
+
+        buf_list = list(self._buffer)
+        n = len(buf_list)
+
+        for epoch in range(ONLINE_TRAIN_EPOCHS):
+            # Shuffle buffer indices
+            indices = np.random.permutation(n)
+            batch_losses = []
+
+            # Process in mini-batches of 8
+            batch_size = min(8, n)
+            for start in range(0, n, batch_size):
+                batch_idx = indices[start:start + batch_size]
+                if len(batch_idx) == 0:
+                    break
+
+                # Build batch
+                X_list = []
+                y_list = []
+                for i in batch_idx:
+                    window, target = buf_list[i]
+                    # Scale features
+                    w = self._scaler.transform(window.reshape(-1, self._num_features))
+                    np.nan_to_num(w, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+                    X_list.append(w.reshape(LOOKBACK, self._num_features))
+                    # Normalize target same way as training
+                    y_list.append((target - self._y_mean) / self._y_std)
+
+                X_batch = torch.tensor(np.array(X_list), dtype=torch.float32).to(self._device)
+                y_batch = torch.tensor(np.array(y_list), dtype=torch.float32).to(self._device)
+
+                self._optimizer.zero_grad()
+                preds = self._model(X_batch)
+                loss = self._criterion(preds, y_batch)
+                loss.backward()
+                nn.utils.clip_grad_norm_(self._model.parameters(), ONLINE_GRAD_CLIP)
+                self._optimizer.step()
+                batch_losses.append(loss.item())
+
+        self._model.eval()
+        self._train_rounds += 1
+
+        avg_loss = np.mean(batch_losses) if batch_losses else 0
+        print(f"  [Online] Training round {self._train_rounds}: "
+              f"loss={avg_loss:.4f}, buffer={n} samples, "
+              f"total_seen={self._total_samples}")
+
+        # Periodically save updated checkpoint
+        if self._train_rounds % ONLINE_SAVE_INTERVAL == 0:
+            self._save_checkpoint()
+
+    def _save_checkpoint(self):
+        """Save the fine-tuned model to a separate checkpoint file."""
+        save_path = self._checkpoint_path.replace(".pt", "_live.pt")
+        torch.save({
+            "model_state_dict": self._model.state_dict(),
+            "num_features": self._num_features,
+            "y_mean": self._y_mean,
+            "y_std": self._y_std,
+            "lookback": LOOKBACK,
+            "horizon": HORIZON,
+            "online_train_rounds": self._train_rounds,
+            "online_total_samples": self._total_samples,
+        }, save_path)
+        print(f"  [Online] Checkpoint saved: {save_path} "
+              f"(round {self._train_rounds})")
+
+    def save_final(self):
+        """Save final checkpoint when session ends."""
+        if self._train_rounds > 0:
+            self._save_checkpoint()
+            print(f"  [Online] Final model saved after {self._train_rounds} training rounds "
+                  f"({self._total_samples} total samples).")
 
 
 # ─────────────────────────────────────────────
@@ -463,23 +613,38 @@ def run(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     api_key = _get_api_key()
 
+    # Determine which checkpoint to load
+    ckpt_path = args.live_checkpoint if args.live_checkpoint else args.checkpoint
+    online_enabled = not args.no_online
+
     banner("NQ LIVE TRADING MODULE")
     print(f"  Device:       {device}")
-    print(f"  Checkpoint:   {args.checkpoint}")
+    print(f"  Checkpoint:   {ckpt_path}")
     print(f"  Data source:  Databento Live ({DATABENTO_DATASET}, {DATABENTO_SYMBOL})")
     print(f"  TP pct:       {args.tp_pct}")
     print(f"  SL pct:       {args.sl_pct}")
     print(f"  Threshold:    {args.threshold} pts")
     print(f"  Poll interval:{args.poll_interval}s")
+    print(f"  Online learn: {'ON' if online_enabled else 'OFF'}")
 
     # Load model
     print()
     print("  Loading model...")
-    model, y_mean, y_std, num_features = load_checkpoint(args.checkpoint, device)
+    model, y_mean, y_std, num_features = load_checkpoint(ckpt_path, device)
     print(f"  Model loaded ({num_features} features, y_mean={y_mean:.4f}, y_std={y_std:.4f})")
 
     # Calibrate scaler
     scaler = calibrate_scaler(args.data_file, num_features)
+
+    # Initialize online learner
+    learner = None
+    if online_enabled:
+        learner = OnlineLearner(
+            model, device, scaler, y_mean, y_std, num_features,
+            checkpoint_path=args.checkpoint,
+        )
+        print(f"  Online learner initialized (buffer={ONLINE_MAX_SAMPLES}, "
+              f"lr={ONLINE_LR}, min_samples={ONLINE_MIN_SAMPLES})")
 
     # CSV mode: single prediction, no Databento needed
     if args.csv:
@@ -573,6 +738,9 @@ def run(args):
             print(f"  SL: {-sl_level:+.2f} pts -> {sl_price:,.2f}  (sl_pct={args.sl_pct})")
             print(f"  Max bars:      {HORIZON}")
 
+            # Snapshot the bars at entry time for online learning
+            entry_bars_snapshot = raw_df.copy() if learner else None
+
             # Monitor trade using live stream prices
             result = monitor_trade(
                 stream, direction, entry_price, tp_level, sl_level,
@@ -597,14 +765,28 @@ def run(args):
                   f"Total P&L: ${total_pnl:+,.2f}")
             print()
 
+            # Online learning: record actual outcome
+            if learner and entry_bars_snapshot is not None:
+                actual_move = result["exit_price"] - entry_price
+                # For TP/SL exits, use the actual exit price move (not capped levels)
+                # to teach the model what really happened
+                learner.record_outcome(entry_bars_snapshot, None, actual_move)
+                print(f"  [Online] Recorded outcome: predicted={pred_points:+.2f}, "
+                      f"actual={actual_move:+.2f} pts")
+
     except KeyboardInterrupt:
         stream.stop()
+        if learner:
+            learner.save_final()
         banner("SESSION ENDED")
         if total_trades > 0:
             win_rate = wins / total_trades * 100
             print(f"  Trades:    {total_trades}")
             print(f"  Wins:      {wins} ({win_rate:.0f}%)")
             print(f"  Total P&L: ${total_pnl:+,.2f}")
+            if learner:
+                print(f"  Online:    {learner._train_rounds} training rounds, "
+                      f"{learner._total_samples} samples learned")
         else:
             print("  No trades executed.")
         print()
@@ -631,6 +813,10 @@ def parse_args():
                         help=f"Training data for scaler calibration (default: {DATA_FILE})")
     parser.add_argument("--csv", type=str, default=None,
                         help="Path to CSV file with OHLCV data (bypasses Databento)")
+    parser.add_argument("--no-online", action="store_true",
+                        help="Disable online learning from live trade outcomes")
+    parser.add_argument("--live-checkpoint", type=str, default=None,
+                        help="Resume from a live-updated checkpoint (e.g. nq_checkpoint_live.pt)")
     return parser.parse_args()
 
 

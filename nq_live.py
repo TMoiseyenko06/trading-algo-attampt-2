@@ -1,8 +1,8 @@
 """
 NQ Futures Live Trading Module
 ===============================
-Fetches real-time 1-minute bars from Databento, runs predictions through
-the trained CNN+LSTM model, and manages trades with TP/SL/expiry logic.
+Streams real-time 1-minute bars from Databento Live API, runs predictions
+through the trained CNN+LSTM model, and manages trades with TP/SL/expiry logic.
 
 Trade entry/exit is printed to CLI (manual execution).
 
@@ -18,7 +18,8 @@ import sys
 import time
 import logging
 import argparse
-from datetime import datetime, timedelta
+import threading
+from datetime import datetime, timedelta, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -45,10 +46,13 @@ from nq_predictor import (
     TRAIN_RATIO,
 )
 
-# How many raw bars to fetch.
+# How many raw bars to fetch for initial warmup.
 # build_features() needs ~60 bars of warm-up (SMA60 is the longest rolling window),
-# plus LOOKBACK (90) bars of usable features = 150 minimum. Add buffer.
+# plus LOOKBACK (120) bars of usable features = 180 minimum. Add buffer.
 FETCH_BARS = 200
+
+# Max bars to keep in the rolling buffer (prevents unbounded memory growth)
+MAX_BUFFER_BARS = 500
 
 # Databento config
 DATABENTO_DATASET = "GLBX.MDP3"
@@ -68,6 +72,25 @@ def banner(text):
     print("=" * w)
     print(f"  {text}")
     print("=" * w)
+
+
+def _get_api_key():
+    """Read Databento API key from environment."""
+    api_key = os.environ.get("DATABENTO_API_KEY")
+    if not api_key:
+        print("ERROR: Missing DATABENTO_API_KEY in .env file.")
+        print("  Required variable:")
+        print("    DATABENTO_API_KEY=db-your-api-key-here")
+        sys.exit(1)
+    return api_key
+
+
+def _convert_price(price):
+    """Convert Databento fixed-point price (1e-9 scale) to float."""
+    p = float(price)
+    if p > 1e6:
+        p = p / 1e9
+    return p
 
 
 # ─────────────────────────────────────────────
@@ -112,131 +135,196 @@ def calibrate_scaler(data_file, num_features):
 
 
 # ─────────────────────────────────────────────
-# Databento data
+# Databento Live streaming
 # ─────────────────────────────────────────────
-def _get_databento_client():
-    """Create a Databento Historical client from env API key."""
-    api_key = os.environ.get("DATABENTO_API_KEY")
-    if not api_key:
-        print("ERROR: Missing DATABENTO_API_KEY in .env file.")
-        print("  Required variable:")
-        print("    DATABENTO_API_KEY=db-your-api-key-here")
+class LiveBarStream:
+    """Streams 1-minute OHLCV bars from Databento Live API in a background thread.
+
+    Maintains a rolling DataFrame of recent bars. The main thread can:
+      - Wait for new bars via wait_for_bar()
+      - Read the latest price via latest_price
+      - Access the full rolling history via get_bars()
+    """
+
+    def __init__(self, api_key, warmup_bars=FETCH_BARS):
+        self._api_key = api_key
+        self._warmup_bars = warmup_bars
+        self._lock = threading.Lock()
+        self._new_bar_event = threading.Event()
+        self._bars = pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+        self._latest_price = None
+        self._live_client = None
+        self._thread = None
+        self._running = False
+        self._error = None
+
+    @property
+    def latest_price(self):
+        with self._lock:
+            return self._latest_price
+
+    def get_bars(self):
+        """Return a copy of the rolling bar DataFrame."""
+        with self._lock:
+            return self._bars.copy()
+
+    def bar_count(self):
+        with self._lock:
+            return len(self._bars)
+
+    def wait_for_bar(self, timeout=120):
+        """Block until a new bar arrives. Returns True if bar received, False on timeout."""
+        self._new_bar_event.clear()
+        return self._new_bar_event.wait(timeout=timeout)
+
+    def start(self):
+        """Fetch historical warmup bars, then start the live stream."""
+        self._fetch_warmup()
+        self._running = True
+        self._thread = threading.Thread(target=self._stream_loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        """Stop the live stream."""
+        self._running = False
+        if self._live_client is not None:
+            try:
+                self._live_client.stop()
+            except Exception:
+                pass
+
+    def _fetch_warmup(self):
+        """Use Historical API to get initial bars for feature computation."""
+        print(f"  Fetching {self._warmup_bars} warmup bars from Databento Historical...")
+        client = db.Historical(self._api_key)
+        end_time = datetime.now(timezone.utc)
+        start_time = end_time - timedelta(minutes=self._warmup_bars * 3)
+
+        for attempt in range(1, 4):
+            try:
+                data = client.timeseries.get_range(
+                    dataset=DATABENTO_DATASET,
+                    symbols=DATABENTO_SYMBOL,
+                    stype_in="continuous",
+                    schema="ohlcv-1m",
+                    start=start_time.strftime("%Y-%m-%dT%H:%M"),
+                    end=end_time.strftime("%Y-%m-%dT%H:%M"),
+                )
+
+                df = data.to_df()
+                if df.empty:
+                    logger.warning(f"  Empty warmup data (attempt {attempt}/3)")
+                    if attempt < 3:
+                        time.sleep(2 ** attempt)
+                    continue
+
+                price_cols = ["open", "high", "low", "close"]
+                for col in price_cols:
+                    if col in df.columns and df[col].median() > 1e6:
+                        df[col] = df[col] / 1e9
+
+                if "volume" not in df.columns and "size" in df.columns:
+                    df["volume"] = df["size"]
+
+                keep_cols = [c for c in ["open", "high", "low", "close", "volume"] if c in df.columns]
+                df = df[keep_cols].copy()
+                df = df.dropna()
+                df = df[(df["close"] > 0) & (df["volume"] >= 0)]
+
+                if len(df) > self._warmup_bars:
+                    df = df.iloc[-self._warmup_bars:]
+
+                df = df.reset_index(drop=True)
+
+                with self._lock:
+                    self._bars = df
+                    self._latest_price = float(df["close"].iloc[-1])
+
+                print(f"  Warmup complete: {len(df)} bars loaded, "
+                      f"latest price: {self._latest_price:,.2f}")
+                return
+
+            except Exception as e:
+                logger.warning(f"  Warmup fetch failed (attempt {attempt}/3): {e}")
+                if attempt < 3:
+                    time.sleep(2 ** attempt)
+
+        print("ERROR: Failed to fetch warmup bars after 3 attempts.")
         sys.exit(1)
-    return db.Historical(api_key)
+
+    def _stream_loop(self):
+        """Background thread: connect to Databento Live and stream bars."""
+        while self._running:
+            try:
+                self._live_client = db.Live(key=self._api_key)
+                self._live_client.subscribe(
+                    dataset=DATABENTO_DATASET,
+                    schema="ohlcv-1m",
+                    symbols=[DATABENTO_SYMBOL],
+                    stype_in="continuous",
+                )
+                self._live_client.start()
+
+                print(f"  [{timestamp()}] Live stream connected.")
+                self._error = None
+
+                for record in self._live_client:
+                    if not self._running:
+                        break
+                    self._process_record(record)
+
+            except Exception as e:
+                if not self._running:
+                    break
+                self._error = str(e)
+                logger.warning(f"  Live stream error: {e}")
+                print(f"  [{timestamp()}] Live stream disconnected: {e}")
+                print(f"  [{timestamp()}] Reconnecting in 5s...")
+                time.sleep(5)
+
+    def _process_record(self, record):
+        """Extract OHLCV from a live record and append to rolling buffer."""
+        # OhlcvMsg has open, high, low, close, volume attributes
+        if not hasattr(record, "open"):
+            return
+
+        o = _convert_price(record.open)
+        h = _convert_price(record.high)
+        l = _convert_price(record.low)
+        c = _convert_price(record.close)
+        v = float(record.volume) if hasattr(record, "volume") else 0.0
+
+        if c <= 0:
+            return
+
+        new_row = pd.DataFrame(
+            [[o, h, l, c, v]],
+            columns=["open", "high", "low", "close", "volume"],
+        )
+
+        with self._lock:
+            self._bars = pd.concat([self._bars, new_row], ignore_index=True)
+            # Trim to max buffer size
+            if len(self._bars) > MAX_BUFFER_BARS:
+                self._bars = self._bars.iloc[-MAX_BUFFER_BARS:].reset_index(drop=True)
+            self._latest_price = c
+
+        # Signal the main thread that a new bar arrived
+        self._new_bar_event.set()
 
 
-def fetch_bars(n_bars=FETCH_BARS, max_retries=3):
-    """Fetch recent 1-minute bars from Databento (with retry)."""
-    for attempt in range(1, max_retries + 1):
-        try:
-            client = _get_databento_client()
-            end_time = datetime.utcnow()
-            # Request extra time to account for gaps (weekends, holidays, off-hours)
-            start_time = end_time - timedelta(minutes=n_bars * 3)
-
-            data = client.timeseries.get_range(
-                dataset=DATABENTO_DATASET,
-                symbols=DATABENTO_SYMBOL,
-                stype_in="continuous",
-                schema="ohlcv-1m",
-                start=start_time.strftime("%Y-%m-%dT%H:%M"),
-                end=end_time.strftime("%Y-%m-%dT%H:%M"),
-            )
-
-            df = data.to_df()
-            if df.empty:
-                logger.warning(f"  Databento returned empty data (attempt {attempt}/{max_retries})")
-                if attempt < max_retries:
-                    time.sleep(2 ** attempt)
-                continue
-
-            # Databento stores prices as fixed-point integers (1e-9 scale)
-            price_cols = ["open", "high", "low", "close"]
-            for col in price_cols:
-                if col in df.columns and df[col].median() > 1e6:
-                    df[col] = df[col] / 1e9
-
-            # Ensure volume column exists
-            if "volume" not in df.columns and "size" in df.columns:
-                df["volume"] = df["size"]
-
-            # Keep only OHLCV
-            keep_cols = [c for c in ["open", "high", "low", "close", "volume"] if c in df.columns]
-            df = df[keep_cols].copy()
-            df = df.dropna()
-            df = df[(df["close"] > 0) & (df["volume"] >= 0)]
-
-            # Keep only the last n_bars
-            if len(df) > n_bars:
-                df = df.iloc[-n_bars:]
-
-            df = df.reset_index(drop=True)
-            return df
-
-        except Exception as e:
-            logger.warning(f"  Databento fetch failed (attempt {attempt}/{max_retries}): {e}")
-            if attempt < max_retries:
-                wait = 2 ** attempt
-                print(f"  Retrying in {wait}s...")
-                time.sleep(wait)
-
-    print(f"  Databento fetch failed after {max_retries} attempts.")
-    return None
-
-
-def fetch_latest_price(max_retries=3):
-    """Fetch the most recent close price from Databento."""
-    for attempt in range(1, max_retries + 1):
-        try:
-            client = _get_databento_client()
-            end_time = datetime.utcnow()
-            start_time = end_time - timedelta(minutes=5)
-
-            data = client.timeseries.get_range(
-                dataset=DATABENTO_DATASET,
-                symbols=DATABENTO_SYMBOL,
-                stype_in="continuous",
-                schema="ohlcv-1m",
-                start=start_time.strftime("%Y-%m-%dT%H:%M"),
-                end=end_time.strftime("%Y-%m-%dT%H:%M"),
-            )
-
-            df = data.to_df()
-            if df.empty:
-                logger.warning(f"  No recent bars returned (attempt {attempt}/{max_retries})")
-                if attempt < max_retries:
-                    time.sleep(2 ** attempt)
-                continue
-
-            close_col = df["close"].iloc[-1]
-            price = float(close_col)
-            # Handle fixed-point prices
-            if price > 1e6:
-                price = price / 1e9
-            return price
-
-        except Exception as e:
-            logger.warning(f"  Price fetch failed (attempt {attempt}/{max_retries}): {e}")
-            if attempt < max_retries:
-                wait = 2 ** attempt
-                print(f"  Retrying in {wait}s...")
-                time.sleep(wait)
-
-    print(f"  Price fetch failed after {max_retries} attempts.")
-    return None
-
-
+# ─────────────────────────────────────────────
+# CSV fallback (unchanged)
+# ─────────────────────────────────────────────
 def load_csv(path):
     """Load OHLCV data from a TradingView-exported CSV file."""
     df = pd.read_csv(path)
     df.columns = [c.strip().lower() for c in df.columns]
-    # TV uses various volume column names — try to find it
     if "volume" not in df.columns:
         for col in df.columns:
             if "vol" in col:
                 df = df.rename(columns={col: "volume"})
                 break
-    # If still no volume column, fill with zeros (model can still predict)
     if "volume" not in df.columns:
         print("  NOTE: No volume column found, filling with zeros")
         df["volume"] = 0.0
@@ -283,10 +371,10 @@ def predict(model, device, scaler, y_mean, y_std, num_features, raw_df):
 
 
 # ─────────────────────────────────────────────
-# Trade monitoring
+# Trade monitoring (now uses live stream)
 # ─────────────────────────────────────────────
-def monitor_trade(direction, entry_price, tp_level, sl_level, poll_interval):
-    """Poll price until TP, SL, or expiry (HORIZON bars). Returns exit_info dict."""
+def monitor_trade(stream, direction, entry_price, tp_level, sl_level, poll_interval):
+    """Monitor live price stream until TP, SL, or expiry (HORIZON bars). Returns exit_info dict."""
     bars_elapsed = 0
     last_bar_time = datetime.now()
 
@@ -296,9 +384,9 @@ def monitor_trade(direction, entry_price, tp_level, sl_level, poll_interval):
     while bars_elapsed < HORIZON:
         time.sleep(poll_interval)
 
-        price = fetch_latest_price()
+        price = stream.latest_price
         if price is None:
-            print(f"  [{timestamp()}] Price fetch failed, retrying...")
+            print(f"  [{timestamp()}] No price available, waiting...")
             continue
 
         # Count new 1-minute bars by elapsed time
@@ -339,10 +427,10 @@ def monitor_trade(direction, entry_price, tp_level, sl_level, poll_interval):
                 "bars_held": bar_display,
             }
 
-    # Expiry — fetch final price
-    price = fetch_latest_price()
+    # Expiry — use latest streamed price
+    price = stream.latest_price
     if price is None:
-        price = entry_price  # fallback
+        price = entry_price
     move = price - entry_price
     pnl_points = direction * move
     return {
@@ -360,11 +448,12 @@ def monitor_trade(direction, entry_price, tp_level, sl_level, poll_interval):
 def run(args):
     load_dotenv()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    api_key = _get_api_key()
 
     banner("NQ LIVE TRADING MODULE")
     print(f"  Device:       {device}")
     print(f"  Checkpoint:   {args.checkpoint}")
-    print(f"  Data source:  Databento ({DATABENTO_DATASET}, {DATABENTO_SYMBOL})")
+    print(f"  Data source:  Databento Live ({DATABENTO_DATASET}, {DATABENTO_SYMBOL})")
     print(f"  TP pct:       {args.tp_pct}")
     print(f"  SL pct:       {args.sl_pct}")
     print(f"  Threshold:    {args.threshold} pts")
@@ -409,44 +498,49 @@ def run(args):
             print(f"  ** Above threshold — would ENTER {direction} **")
         return
 
-    # Verify Databento credentials
-    _get_databento_client()
-    print("  Databento API key verified.")
+    # Start live bar stream
+    stream = LiveBarStream(api_key)
+    stream.start()
+    print(f"  Databento Live stream active.")
 
     # Session stats
     total_trades = 0
     total_pnl = 0.0
     wins = 0
 
-    banner("LIVE LOOP STARTED")
-    print(f"  [{timestamp()}] Waiting for signals...\n")
+    banner("LIVE LOOP STARTED — STREAMING")
+    print(f"  [{timestamp()}] Waiting for new bars...\n")
 
     try:
         while True:
-            # 1. Fetch recent bars
-            raw_df = fetch_bars()
-            if raw_df is None:
-                print(f"  [{timestamp()}] Data fetch failed, retrying in 60s...")
-                time.sleep(60)
+            # Block until a new 1-minute bar arrives from the live stream
+            got_bar = stream.wait_for_bar(timeout=120)
+            if not got_bar:
+                print(f"  [{timestamp()}] No bar received in 120s, stream may be stale...")
                 continue
 
-            # 2. Predict
+            # Get rolling bar history
+            raw_df = stream.get_bars()
+            if len(raw_df) < LOOKBACK + 60:
+                print(f"  [{timestamp()}] Buffering... {len(raw_df)} bars "
+                      f"(need {LOOKBACK + 60})")
+                continue
+
+            # Predict
             pred_points, entry_price = predict(
                 model, device, scaler, y_mean, y_std, num_features, raw_df
             )
             if pred_points is None:
-                print(f"  [{timestamp()}] Not enough feature data, retrying in 60s...")
-                time.sleep(60)
+                print(f"  [{timestamp()}] Not enough feature data, waiting...")
                 continue
 
-            # 3. Check threshold
+            # Check threshold
             if abs(pred_points) < args.threshold:
                 print(f"  [{timestamp()}] Pred: {pred_points:+.2f} pts "
                       f"(below threshold {args.threshold}), skipping...")
-                time.sleep(60)
                 continue
 
-            # 4. Trade setup
+            # Trade setup
             direction = 1.0 if pred_points > 0 else -1.0
             direction_str = "LONG" if direction > 0 else "SHORT"
             tp_level = abs(pred_points) * args.tp_pct
@@ -455,7 +549,7 @@ def run(args):
             tp_price = entry_price + direction * tp_level
             sl_price = entry_price - direction * sl_level
 
-            # 5. Print trade entry
+            # Print trade entry
             banner(f"TRADE ENTRY — {direction_str}")
             print(f"  Time:          {timestamp()}")
             print(f"  Predicted move:{pred_points:+.2f} pts")
@@ -466,13 +560,13 @@ def run(args):
             print(f"  SL: {-sl_level:+.2f} pts -> {sl_price:,.2f}  (sl_pct={args.sl_pct})")
             print(f"  Max bars:      {HORIZON}")
 
-            # 6. Monitor trade
+            # Monitor trade using live stream prices
             result = monitor_trade(
-                direction, entry_price, tp_level, sl_level,
+                stream, direction, entry_price, tp_level, sl_level,
                 args.poll_interval,
             )
 
-            # 7. Print trade exit
+            # Print trade exit
             total_trades += 1
             total_pnl += result["pnl_dollars"]
             if result["pnl_dollars"] > 0:
@@ -490,11 +584,8 @@ def run(args):
                   f"Total P&L: ${total_pnl:+,.2f}")
             print()
 
-            # 8. Brief pause before next cycle
-            print(f"  [{timestamp()}] Waiting 60s before next scan...\n")
-            time.sleep(60)
-
     except KeyboardInterrupt:
+        stream.stop()
         banner("SESSION ENDED")
         if total_trades > 0:
             win_rate = wins / total_trades * 100
@@ -511,7 +602,7 @@ def run(args):
 # ─────────────────────────────────────────────
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="NQ Live Trading — CNN+LSTM predictions with Databento data"
+        description="NQ Live Trading — CNN+LSTM predictions with Databento Live streaming"
     )
     parser.add_argument("--tp-pct", type=float, default=1.0,
                         help="TP as fraction of predicted move (default: 1.0)")

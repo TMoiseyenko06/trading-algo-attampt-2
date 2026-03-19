@@ -750,7 +750,7 @@ def run(args):
             # Print trade exit
             total_trades += 1
             total_pnl += result["pnl_dollars"]
-            if result["pnl_dollars"] > 0:
+            if result["reason"] == "TP HIT":
                 wins += 1
 
             banner(f"TRADE CLOSED — {result['reason']}")

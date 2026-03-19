@@ -207,7 +207,9 @@ class LiveBarStream:
         """Use Historical API to get initial bars for feature computation."""
         print(f"  Fetching {self._warmup_bars} warmup bars from Databento Historical...")
         client = db.Historical(self._api_key)
-        end_time = datetime.now(timezone.utc)
+        # Historical API has a delay — data isn't available right up to "now".
+        # Pull up to 15 minutes ago to stay within the available range.
+        end_time = datetime.now(timezone.utc) - timedelta(minutes=15)
         start_time = end_time - timedelta(minutes=self._warmup_bars * 3)
 
         for attempt in range(1, 4):

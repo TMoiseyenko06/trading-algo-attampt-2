@@ -1,14 +1,15 @@
 """
 NQ Futures Live Trading Module
 ===============================
-Streams real-time 1-minute bars from Databento Live API, runs predictions
-through the trained CNN+LSTM model, and manages trades with TP/SL/expiry logic.
+Streams real-time 1-minute bars from Databento Live API, trains a CNN+LSTM
+model from scratch on live data, and manages trades with TP/SL/expiry logic.
+
+The model starts with random weights and learns entirely from live market
+data. A warmup phase collects samples before trading begins.
 
 Trade entry/exit is printed to CLI (manual execution).
 
 Requires:
-  - Trained checkpoint (nq_checkpoint.pt)
-  - Training data (nq.dbn) for scaler calibration
   - Databento API key in .env: DATABENTO_API_KEY
   - pip install databento
 """
@@ -33,19 +34,14 @@ import databento as db
 from sklearn.preprocessing import StandardScaler
 from collections import deque
 
-# Reuse model, features, and data loading from the training module
+# Reuse model and features from the training module
 from nq_predictor import (
     NQPredictor,
     build_features,
-    load_data,
-    create_windows,
     LOOKBACK,
     HORIZON,
     TRADE_THRESHOLD,
     NQ_MULTIPLIER,
-    CHECKPOINT_FILE,
-    DATA_FILE,
-    TRAIN_RATIO,
 )
 
 # How many raw bars to fetch for initial warmup.
@@ -96,156 +92,212 @@ def _convert_price(price):
 
 
 # ─────────────────────────────────────────────
-# Startup: load model + calibrate scaler
+# Online learning from live data (train from scratch)
 # ─────────────────────────────────────────────
-def load_checkpoint(path, device):
-    """Load trained model and normalization stats from checkpoint."""
-    if not os.path.exists(path):
-        print(f"ERROR: Checkpoint not found: {path}")
-        sys.exit(1)
-
-    ckpt = torch.load(path, map_location=device, weights_only=False)
-    model = NQPredictor(ckpt["num_features"])
-    model.load_state_dict(ckpt["model_state_dict"])
-    model.to(device)
-    model.eval()
-
-    return model, ckpt["y_mean"], ckpt["y_std"], ckpt["num_features"]
-
-
-def calibrate_scaler(data_file, num_features):
-    """Reproduce the exact StandardScaler from training by re-fitting on the
-    training portion of the historical data (same logic as nq_predictor.py).
-
-    Optimization: StandardScaler computes per-feature mean/std, which is
-    identical whether computed on flattened windows or on the raw feature rows
-    (since each row appears in exactly LOOKBACK consecutive windows in the
-    training set, the mean/std are unchanged). This avoids the expensive
-    create_windows() call on millions of rows."""
-    if not os.path.exists(data_file):
-        print(f"ERROR: Training data not found: {data_file}")
-        print("The .dbn file is needed once at startup to calibrate the feature scaler.")
-        sys.exit(1)
-
-    print(f"  Loading {data_file} for scaler calibration...")
-    df = load_data(data_file)
-    features_df = build_features(df)
-
-    # Determine training split the same way as nq_predictor.py:
-    # number of possible windows = len(features_df) - LOOKBACK - HORIZON
-    n_windows = len(features_df) - LOOKBACK - HORIZON
-    split_idx = int(n_windows * TRAIN_RATIO)
-    # Training windows use feature rows from index 0..split_idx+LOOKBACK-1
-    train_end = split_idx + LOOKBACK
-    train_features = features_df.iloc[:train_end].values.astype(np.float32)
-
-    scaler = StandardScaler()
-    scaler.fit(train_features)
-    print(f"  Scaler calibrated on {len(train_features):,} feature rows "
-          f"(~{split_idx:,} training windows).")
-    return scaler
-
-
-# ─────────────────────────────────────────────
-# Online learning from live data
-# ─────────────────────────────────────────────
-ONLINE_LR = 1e-5               # Very low LR for fine-tuning (avoid catastrophic forgetting)
-ONLINE_GRAD_CLIP = 0.5         # Tighter gradient clipping for stability
-ONLINE_MIN_SAMPLES = 8         # Minimum replay buffer size before training
-ONLINE_MAX_SAMPLES = 512       # Max replay buffer size (rolling window of recent data)
-ONLINE_TRAIN_EPOCHS = 3        # Gradient steps per online training round
+NUM_FEATURES = 17              # build_features() produces 17 columns
+ONLINE_LR = 1e-3               # Higher LR for training from scratch
+ONLINE_GRAD_CLIP = 1.0         # Gradient clipping
+ONLINE_MIN_SAMPLES = 32        # Min samples before first training round
+ONLINE_MAX_SAMPLES = 2048      # Max replay buffer size
+ONLINE_TRAIN_EPOCHS = 5        # Gradient steps per training round
+ONLINE_BATCH_SIZE = 16         # Mini-batch size
 ONLINE_SAVE_INTERVAL = 10      # Save checkpoint every N training rounds
+ONLINE_CHECKPOINT = "nq_live_model.pt"
 
 
 class OnlineLearner:
-    """Incrementally fine-tunes the model on live trade outcomes.
+    """Trains a CNN+LSTM model from scratch on live market data.
 
-    After each trade's HORIZON window expires, we know the actual price move.
-    This class:
-      1. Stores (features_window, actual_target) pairs in a replay buffer
-      2. Periodically runs a few gradient steps to fine-tune the model
-      3. Saves updated checkpoints
+    Collects training samples passively from every bar:
+      - At time T, snapshots the feature window (LOOKBACK bars)
+      - At time T+HORIZON, records the actual price move as the target
+      - Trains the model once enough samples accumulate
+
+    The scaler and target normalization stats are built incrementally
+    from live data — no pretrained model or historical data file needed.
     """
 
-    def __init__(self, model, device, scaler, y_mean, y_std, num_features,
-                 checkpoint_path):
-        self._model = model
+    def __init__(self, device):
         self._device = device
-        self._scaler = scaler
-        self._y_mean = y_mean
-        self._y_std = y_std
-        self._num_features = num_features
-        self._checkpoint_path = checkpoint_path
+        self._num_features = NUM_FEATURES
 
-        # Replay buffer: stores (X_window, y_target) tuples
-        # X_window: np.array (LOOKBACK, num_features) — raw features (pre-scaler)
-        # y_target: float — actual NQ point move over HORIZON bars
+        # Fresh random model
+        self._model = NQPredictor(NUM_FEATURES)
+        self._model.to(device)
+        self._model.eval()
+
+        # Incremental scaler — uses partial_fit to update with each new window
+        self._scaler = StandardScaler()
+        self._scaler_fitted = False
+        self._scaler_samples = 0
+
+        # Running target stats (for normalizing y values)
+        self._y_sum = 0.0
+        self._y_sum_sq = 0.0
+        self._y_count = 0
+
+        # Replay buffer: (X_window, y_target) tuples
+        # X_window: raw features (LOOKBACK, NUM_FEATURES) before scaling
         self._buffer = deque(maxlen=ONLINE_MAX_SAMPLES)
 
-        # Optimizer for fine-tuning (low LR, no weight decay to preserve learned features)
+        # Pending samples: waiting for HORIZON bars to pass
+        # Each entry: (features_window, entry_close, bars_remaining)
+        self._pending = []
+
+        # Optimizer
         self._optimizer = torch.optim.AdamW(
-            model.parameters(), lr=ONLINE_LR, weight_decay=1e-5
+            self._model.parameters(), lr=ONLINE_LR, weight_decay=1e-4
+        )
+        self._scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            self._optimizer, mode="min", factor=0.5, patience=20
         )
         self._criterion = nn.HuberLoss(delta=1.0)
+
         self._train_rounds = 0
         self._total_samples = 0
+        self._ready = False  # True once we have enough samples to trade
 
-    def record_outcome(self, raw_df, entry_idx, actual_move):
-        """Record a completed trade outcome as a training sample.
+    @property
+    def model(self):
+        return self._model
 
-        Args:
-            raw_df: The bar DataFrame at the time of trade entry
-            entry_idx: Not used (kept for API clarity) — we use the last LOOKBACK bars
-            actual_move: The actual close[t+HORIZON] - close[t] in NQ points
+    @property
+    def scaler(self):
+        return self._scaler
+
+    @property
+    def scaler_fitted(self):
+        return self._scaler_fitted
+
+    @property
+    def y_mean(self):
+        if self._y_count < 2:
+            return 0.0
+        return self._y_sum / self._y_count
+
+    @property
+    def y_std(self):
+        if self._y_count < 2:
+            return 1.0
+        variance = (self._y_sum_sq / self._y_count) - (self.y_mean ** 2)
+        return max(np.sqrt(max(variance, 0.0)), 1e-6)
+
+    @property
+    def ready(self):
+        return self._ready
+
+    @property
+    def buffer_size(self):
+        return len(self._buffer)
+
+    @property
+    def pending_count(self):
+        return len(self._pending)
+
+    def on_new_bar(self, raw_df):
+        """Called every time a new bar arrives. Handles passive sample collection.
+
+        1. Snapshots current feature window as a pending sample
+        2. Decrements bars_remaining on all pending samples
+        3. Completes any samples that have reached HORIZON bars
+        4. Updates scaler incrementally
+        5. Triggers training if enough samples
         """
         features_df = build_features(raw_df)
         if len(features_df) < LOOKBACK:
             return
 
-        # Extract the feature window that was used for prediction
+        # Snapshot current window as a pending sample
+        window = features_df.iloc[-LOOKBACK:].values.astype(np.float32)
+        entry_close = float(raw_df["close"].iloc[-1])
+        self._pending.append({
+            "window": window,
+            "entry_close": entry_close,
+            "bars_remaining": HORIZON,
+        })
+
+        # Update scaler with this window's feature rows
+        self._scaler.partial_fit(window)
+        self._scaler_samples += len(window)
+        self._scaler_fitted = True
+
+        # Decrement and complete pending samples
+        completed = []
+        still_pending = []
+        for sample in self._pending:
+            sample["bars_remaining"] -= 1
+            if sample["bars_remaining"] <= 0:
+                # Target = current close - entry close
+                actual_move = entry_close - sample["entry_close"]
+                completed.append((sample["window"], actual_move))
+            else:
+                still_pending.append(sample)
+        self._pending = still_pending
+
+        # Add completed samples to replay buffer
+        for window, target in completed:
+            self._buffer.append((window, target))
+            self._total_samples += 1
+            # Update running target stats
+            self._y_sum += target
+            self._y_sum_sq += target * target
+            self._y_count += 1
+
+        # Train if we have enough samples
+        buf_size = len(self._buffer)
+        if buf_size >= ONLINE_MIN_SAMPLES and len(completed) > 0:
+            self._train_step()
+
+        # Mark ready once we've done at least one training round
+        if self._train_rounds > 0 and not self._ready:
+            self._ready = True
+            print(f"  [Online] Model READY — {buf_size} samples, "
+                  f"y_mean={self.y_mean:.2f}, y_std={self.y_std:.2f}")
+
+    def record_trade_outcome(self, raw_df, actual_move):
+        """Record an additional trade outcome (on top of passive collection)."""
+        features_df = build_features(raw_df)
+        if len(features_df) < LOOKBACK:
+            return
         window = features_df.iloc[-LOOKBACK:].values.astype(np.float32)
         self._buffer.append((window, float(actual_move)))
         self._total_samples += 1
-
-        buf_size = len(self._buffer)
-        if buf_size >= ONLINE_MIN_SAMPLES:
-            self._train_step()
+        self._y_sum += actual_move
+        self._y_sum_sq += actual_move * actual_move
+        self._y_count += 1
 
     def _train_step(self):
-        """Run a few gradient steps on the replay buffer."""
+        """Run gradient steps on the replay buffer."""
         self._model.train()
 
-        # Freeze batch norm layers to prevent distribution shift
+        # Freeze batch norm during training from scratch too — let running
+        # stats stabilize before using them
         for module in self._model.modules():
             if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d)):
                 module.eval()
 
         buf_list = list(self._buffer)
         n = len(buf_list)
+        y_mean = self.y_mean
+        y_std = self.y_std
 
+        all_losses = []
         for epoch in range(ONLINE_TRAIN_EPOCHS):
-            # Shuffle buffer indices
             indices = np.random.permutation(n)
-            batch_losses = []
 
-            # Process in mini-batches of 8
-            batch_size = min(8, n)
-            for start in range(0, n, batch_size):
-                batch_idx = indices[start:start + batch_size]
+            for start in range(0, n, ONLINE_BATCH_SIZE):
+                batch_idx = indices[start:start + ONLINE_BATCH_SIZE]
                 if len(batch_idx) == 0:
                     break
 
-                # Build batch
                 X_list = []
                 y_list = []
                 for i in batch_idx:
                     window, target = buf_list[i]
-                    # Scale features
                     w = self._scaler.transform(window.reshape(-1, self._num_features))
                     np.nan_to_num(w, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
                     X_list.append(w.reshape(LOOKBACK, self._num_features))
-                    # Normalize target same way as training
-                    y_list.append((target - self._y_mean) / self._y_std)
+                    y_list.append((target - y_mean) / y_std)
 
                 X_batch = torch.tensor(np.array(X_list), dtype=torch.float32).to(self._device)
                 y_batch = torch.tensor(np.array(y_list), dtype=torch.float32).to(self._device)
@@ -256,42 +308,90 @@ class OnlineLearner:
                 loss.backward()
                 nn.utils.clip_grad_norm_(self._model.parameters(), ONLINE_GRAD_CLIP)
                 self._optimizer.step()
-                batch_losses.append(loss.item())
+                all_losses.append(loss.item())
 
         self._model.eval()
         self._train_rounds += 1
 
-        avg_loss = np.mean(batch_losses) if batch_losses else 0
-        print(f"  [Online] Training round {self._train_rounds}: "
-              f"loss={avg_loss:.4f}, buffer={n} samples, "
-              f"total_seen={self._total_samples}")
+        avg_loss = np.mean(all_losses) if all_losses else 0
+        self._scheduler.step(avg_loss)
+        current_lr = self._optimizer.param_groups[0]["lr"]
 
-        # Periodically save updated checkpoint
+        print(f"  [Online] Round {self._train_rounds}: "
+              f"loss={avg_loss:.4f}, buffer={n}, "
+              f"y_mean={y_mean:.2f}, y_std={y_std:.2f}, "
+              f"lr={current_lr:.6f}")
+
         if self._train_rounds % ONLINE_SAVE_INTERVAL == 0:
             self._save_checkpoint()
 
     def _save_checkpoint(self):
-        """Save the fine-tuned model to a separate checkpoint file."""
-        save_path = self._checkpoint_path.replace(".pt", "_live.pt")
+        """Save the live-trained model."""
         torch.save({
             "model_state_dict": self._model.state_dict(),
             "num_features": self._num_features,
-            "y_mean": self._y_mean,
-            "y_std": self._y_std,
+            "y_mean": self.y_mean,
+            "y_std": self.y_std,
             "lookback": LOOKBACK,
             "horizon": HORIZON,
+            "scaler_mean": self._scaler.mean_.tolist() if self._scaler_fitted else None,
+            "scaler_var": self._scaler.var_.tolist() if self._scaler_fitted else None,
+            "scaler_n": int(self._scaler.n_samples_seen_) if self._scaler_fitted else 0,
             "online_train_rounds": self._train_rounds,
             "online_total_samples": self._total_samples,
-        }, save_path)
-        print(f"  [Online] Checkpoint saved: {save_path} "
+            "y_sum": self._y_sum,
+            "y_sum_sq": self._y_sum_sq,
+            "y_count": self._y_count,
+        }, ONLINE_CHECKPOINT)
+        print(f"  [Online] Checkpoint saved: {ONLINE_CHECKPOINT} "
               f"(round {self._train_rounds})")
 
     def save_final(self):
         """Save final checkpoint when session ends."""
         if self._train_rounds > 0:
             self._save_checkpoint()
-            print(f"  [Online] Final model saved after {self._train_rounds} training rounds "
+            print(f"  [Online] Final model saved after {self._train_rounds} rounds "
                   f"({self._total_samples} total samples).")
+
+    @classmethod
+    def from_checkpoint(cls, path, device):
+        """Resume a live-trained model from a saved checkpoint."""
+        ckpt = torch.load(path, map_location=device, weights_only=False)
+        learner = cls(device)
+
+        learner._model.load_state_dict(ckpt["model_state_dict"])
+        learner._model.to(device)
+        learner._model.eval()
+
+        # Restore scaler
+        if ckpt.get("scaler_mean") is not None:
+            learner._scaler.mean_ = np.array(ckpt["scaler_mean"])
+            learner._scaler.var_ = np.array(ckpt["scaler_var"])
+            learner._scaler.scale_ = np.sqrt(learner._scaler.var_)
+            learner._scaler.n_samples_seen_ = ckpt["scaler_n"]
+            learner._scaler_fitted = True
+
+        # Restore target stats
+        learner._y_sum = ckpt.get("y_sum", 0.0)
+        learner._y_sum_sq = ckpt.get("y_sum_sq", 0.0)
+        learner._y_count = ckpt.get("y_count", 0)
+        learner._train_rounds = ckpt.get("online_train_rounds", 0)
+        learner._total_samples = ckpt.get("online_total_samples", 0)
+        learner._ready = learner._train_rounds > 0
+
+        # Recreate optimizer for the loaded model
+        learner._optimizer = torch.optim.AdamW(
+            learner._model.parameters(), lr=ONLINE_LR, weight_decay=1e-4
+        )
+        learner._scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            learner._optimizer, mode="min", factor=0.5, patience=20
+        )
+
+        print(f"  [Online] Resumed from {path}: "
+              f"{learner._train_rounds} rounds, "
+              f"{learner._total_samples} samples, "
+              f"y_mean={learner.y_mean:.2f}, y_std={learner.y_std:.2f}")
+        return learner
 
 
 # ─────────────────────────────────────────────
@@ -503,31 +603,29 @@ def load_csv(path):
 # ─────────────────────────────────────────────
 # Prediction
 # ─────────────────────────────────────────────
-def predict(model, device, scaler, y_mean, y_std, num_features, raw_df):
+def predict(learner, raw_df):
     """Build features from raw OHLCV, normalize, run model, return prediction in NQ points."""
-    features_df = build_features(raw_df)
+    if not learner.ready or not learner.scaler_fitted:
+        return None, None
 
+    features_df = build_features(raw_df)
     if len(features_df) < LOOKBACK:
         return None, None
 
-    # Take the last LOOKBACK rows as our input window
     window = features_df.iloc[-LOOKBACK:].values.astype(np.float32)
 
-    # Normalize with the training scaler
-    window_flat = window.reshape(-1, num_features)
-    window_flat = scaler.transform(window_flat)
+    # Normalize with the live-built scaler
+    window_flat = window.reshape(-1, NUM_FEATURES)
+    window_flat = learner.scaler.transform(window_flat)
     np.nan_to_num(window_flat, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
-    window = window_flat.reshape(1, LOOKBACK, num_features)
+    window = window_flat.reshape(1, LOOKBACK, NUM_FEATURES)
 
-    # Model forward pass
-    X_tensor = torch.tensor(window, dtype=torch.float32).to(device)
+    X_tensor = torch.tensor(window, dtype=torch.float32).to(learner._device)
     with torch.no_grad():
-        raw_pred = model(X_tensor).item()
+        raw_pred = learner.model(X_tensor).item()
 
     # Denormalize to real NQ points
-    pred_points = raw_pred * y_std + y_mean
-
-    # Entry price is the last close in the raw data
+    pred_points = raw_pred * learner.y_std + learner.y_mean
     entry_price = float(raw_df["close"].iloc[-1])
 
     return pred_points, entry_price
@@ -613,68 +711,24 @@ def run(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     api_key = _get_api_key()
 
-    # Determine which checkpoint to load
-    ckpt_path = args.live_checkpoint if args.live_checkpoint else args.checkpoint
-    online_enabled = not args.no_online
-
-    banner("NQ LIVE TRADING MODULE")
+    banner("NQ LIVE TRADING MODULE — LIVE LEARNING")
     print(f"  Device:       {device}")
-    print(f"  Checkpoint:   {ckpt_path}")
     print(f"  Data source:  Databento Live ({DATABENTO_DATASET}, {DATABENTO_SYMBOL})")
     print(f"  TP pct:       {args.tp_pct}")
     print(f"  SL pct:       {args.sl_pct}")
     print(f"  Threshold:    {args.threshold} pts")
     print(f"  Poll interval:{args.poll_interval}s")
-    print(f"  Online learn: {'ON' if online_enabled else 'OFF'}")
+    print(f"  Min samples:  {ONLINE_MIN_SAMPLES} (before trading)")
 
-    # Load model
+    # Initialize or resume learner
     print()
-    print("  Loading model...")
-    model, y_mean, y_std, num_features = load_checkpoint(ckpt_path, device)
-    print(f"  Model loaded ({num_features} features, y_mean={y_mean:.4f}, y_std={y_std:.4f})")
-
-    # Calibrate scaler
-    scaler = calibrate_scaler(args.data_file, num_features)
-
-    # Initialize online learner
-    learner = None
-    if online_enabled:
-        learner = OnlineLearner(
-            model, device, scaler, y_mean, y_std, num_features,
-            checkpoint_path=args.checkpoint,
-        )
-        print(f"  Online learner initialized (buffer={ONLINE_MAX_SAMPLES}, "
-              f"lr={ONLINE_LR}, min_samples={ONLINE_MIN_SAMPLES})")
-
-    # CSV mode: single prediction, no Databento needed
-    if args.csv:
-        banner("NQ PREDICTION — CSV MODE")
-        raw_df = load_csv(args.csv)
-        print(f"  Loaded {len(raw_df)} bars from {args.csv}")
-
-        pred_points, entry_price = predict(
-            model, device, scaler, y_mean, y_std, num_features, raw_df
-        )
-        if pred_points is None:
-            print("  ERROR: Not enough data for prediction (need ~150+ bars)")
-            sys.exit(1)
-
-        direction = "LONG" if pred_points > 0 else "SHORT"
-        tp = abs(pred_points) * args.tp_pct
-        sl = tp * args.sl_pct
-        entry = entry_price
-
-        print(f"  Predicted move: {pred_points:+.2f} pts")
-        print(f"  Direction:      {direction}")
-        print(f"  Entry price:    {entry:,.2f}")
-        print(f"  TP: {tp:+.2f} pts -> {entry + (1 if pred_points > 0 else -1) * tp:,.2f}")
-        print(f"  SL: {-sl:+.2f} pts -> {entry - (1 if pred_points > 0 else -1) * sl:,.2f}")
-        print(f"  Threshold:      {args.threshold} pts")
-        if abs(pred_points) < args.threshold:
-            print(f"  ** Below threshold — would NOT trade **")
-        else:
-            print(f"  ** Above threshold — would ENTER {direction} **")
-        return
+    if args.resume and os.path.exists(args.resume):
+        print(f"  Resuming from checkpoint: {args.resume}")
+        learner = OnlineLearner.from_checkpoint(args.resume, device)
+    else:
+        print("  Initializing fresh model (random weights)...")
+        learner = OnlineLearner(device)
+        print(f"  Model created ({NUM_FEATURES} features, {ONLINE_MAX_SAMPLES} max buffer)")
 
     # Start live bar stream
     stream = LiveBarStream(api_key)
@@ -686,30 +740,39 @@ def run(args):
     total_pnl = 0.0
     wins = 0
 
-    banner("LIVE LOOP STARTED — STREAMING")
+    banner("LIVE LOOP — COLLECTING & LEARNING")
+    if not learner.ready:
+        print(f"  [{timestamp()}] Warmup phase: collecting {ONLINE_MIN_SAMPLES}+ samples "
+              f"before trading...")
+        print(f"  [{timestamp()}] Each sample takes {HORIZON} bars ({HORIZON} min) to complete.")
     print(f"  [{timestamp()}] Waiting for new bars...\n")
 
     try:
         while True:
-            # Block until a new 1-minute bar arrives from the live stream
             got_bar = stream.wait_for_bar(timeout=120)
             if not got_bar:
                 print(f"  [{timestamp()}] No bar received in 120s, stream may be stale...")
                 continue
 
-            # Get rolling bar history
             raw_df = stream.get_bars()
             if len(raw_df) < LOOKBACK + 60:
                 print(f"  [{timestamp()}] Buffering... {len(raw_df)} bars "
                       f"(need {LOOKBACK + 60})")
                 continue
 
+            # Feed every bar to the learner for passive sample collection
+            learner.on_new_bar(raw_df)
+
+            # During warmup, just show collection progress
+            if not learner.ready:
+                print(f"  [{timestamp()}] Collecting: "
+                      f"{learner.buffer_size}/{ONLINE_MIN_SAMPLES} samples, "
+                      f"{learner.pending_count} pending")
+                continue
+
             # Predict
-            pred_points, entry_price = predict(
-                model, device, scaler, y_mean, y_std, num_features, raw_df
-            )
+            pred_points, entry_price = predict(learner, raw_df)
             if pred_points is None:
-                print(f"  [{timestamp()}] Not enough feature data, waiting...")
                 continue
 
             # Check threshold
@@ -727,7 +790,6 @@ def run(args):
             tp_price = entry_price + direction * tp_level
             sl_price = entry_price - direction * sl_level
 
-            # Print trade entry
             banner(f"TRADE ENTRY — {direction_str}")
             print(f"  Time:          {timestamp()}")
             print(f"  Predicted move:{pred_points:+.2f} pts")
@@ -738,16 +800,13 @@ def run(args):
             print(f"  SL: {-sl_level:+.2f} pts -> {sl_price:,.2f}  (sl_pct={args.sl_pct})")
             print(f"  Max bars:      {HORIZON}")
 
-            # Snapshot the bars at entry time for online learning
-            entry_bars_snapshot = raw_df.copy() if learner else None
+            entry_bars_snapshot = raw_df.copy()
 
-            # Monitor trade using live stream prices
             result = monitor_trade(
                 stream, direction, entry_price, tp_level, sl_level,
                 args.poll_interval,
             )
 
-            # Print trade exit
             total_trades += 1
             total_pnl += result["pnl_dollars"]
             if result["reason"] == "TP HIT":
@@ -765,30 +824,23 @@ def run(args):
                   f"Total P&L: ${total_pnl:+,.2f}")
             print()
 
-            # Online learning: record actual outcome
-            if learner and entry_bars_snapshot is not None:
-                actual_move = result["exit_price"] - entry_price
-                # For TP/SL exits, use the actual exit price move (not capped levels)
-                # to teach the model what really happened
-                learner.record_outcome(entry_bars_snapshot, None, actual_move)
-                print(f"  [Online] Recorded outcome: predicted={pred_points:+.2f}, "
-                      f"actual={actual_move:+.2f} pts")
+            # Record trade outcome as an extra training sample
+            actual_move = result["exit_price"] - entry_price
+            learner.record_trade_outcome(entry_bars_snapshot, actual_move)
+            print(f"  [Online] Trade outcome: predicted={pred_points:+.2f}, "
+                  f"actual={actual_move:+.2f} pts")
 
     except KeyboardInterrupt:
         stream.stop()
-        if learner:
-            learner.save_final()
+        learner.save_final()
         banner("SESSION ENDED")
         if total_trades > 0:
             win_rate = wins / total_trades * 100
             print(f"  Trades:    {total_trades}")
             print(f"  Wins:      {wins} ({win_rate:.0f}%)")
             print(f"  Total P&L: ${total_pnl:+,.2f}")
-            if learner:
-                print(f"  Online:    {learner._train_rounds} training rounds, "
-                      f"{learner._total_samples} samples learned")
-        else:
-            print("  No trades executed.")
+        print(f"  Online:    {learner._train_rounds} training rounds, "
+              f"{learner._total_samples} samples learned")
         print()
 
 
@@ -797,7 +849,7 @@ def run(args):
 # ─────────────────────────────────────────────
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="NQ Live Trading — CNN+LSTM predictions with Databento Live streaming"
+        description="NQ Live Trading — trains CNN+LSTM from scratch on live data"
     )
     parser.add_argument("--tp-pct", type=float, default=1.0,
                         help="TP as fraction of predicted move (default: 1.0)")
@@ -807,16 +859,8 @@ def parse_args():
                         help=f"Min predicted move to enter trade (default: {TRADE_THRESHOLD})")
     parser.add_argument("--poll-interval", type=int, default=10,
                         help="Seconds between price checks during trade (default: 10)")
-    parser.add_argument("--checkpoint", type=str, default=CHECKPOINT_FILE,
-                        help=f"Model checkpoint file (default: {CHECKPOINT_FILE})")
-    parser.add_argument("--data-file", type=str, default=DATA_FILE,
-                        help=f"Training data for scaler calibration (default: {DATA_FILE})")
-    parser.add_argument("--csv", type=str, default=None,
-                        help="Path to CSV file with OHLCV data (bypasses Databento)")
-    parser.add_argument("--no-online", action="store_true",
-                        help="Disable online learning from live trade outcomes")
-    parser.add_argument("--live-checkpoint", type=str, default=None,
-                        help="Resume from a live-updated checkpoint (e.g. nq_checkpoint_live.pt)")
+    parser.add_argument("--resume", type=str, default=ONLINE_CHECKPOINT,
+                        help=f"Resume from a saved live checkpoint (default: {ONLINE_CHECKPOINT})")
     return parser.parse_args()
 
 

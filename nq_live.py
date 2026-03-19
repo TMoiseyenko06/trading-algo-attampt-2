@@ -275,7 +275,6 @@ class LiveBarStream:
                     symbols=[DATABENTO_SYMBOL],
                     stype_in="continuous",
                 )
-                self._live_client.start()
 
                 print(f"  [{timestamp()}] Live stream connected.")
                 self._error = None

@@ -113,7 +113,13 @@ def load_checkpoint(path, device):
 
 def calibrate_scaler(data_file, num_features):
     """Reproduce the exact StandardScaler from training by re-fitting on the
-    training portion of the historical data (same logic as nq_predictor.py)."""
+    training portion of the historical data (same logic as nq_predictor.py).
+
+    Optimization: StandardScaler computes per-feature mean/std, which is
+    identical whether computed on flattened windows or on the raw feature rows
+    (since each row appears in exactly LOOKBACK consecutive windows in the
+    training set, the mean/std are unchanged). This avoids the expensive
+    create_windows() call on millions of rows."""
     if not os.path.exists(data_file):
         print(f"ERROR: Training data not found: {data_file}")
         print("The .dbn file is needed once at startup to calibrate the feature scaler.")
@@ -122,15 +128,19 @@ def calibrate_scaler(data_file, num_features):
     print(f"  Loading {data_file} for scaler calibration...")
     df = load_data(data_file)
     features_df = build_features(df)
-    close_prices = df["close"].loc[features_df.index]
 
-    X, _, _ = create_windows(features_df, close_prices, LOOKBACK, HORIZON)
-    split_idx = int(len(X) * TRAIN_RATIO)
-    X_train = X[:split_idx]
+    # Determine training split the same way as nq_predictor.py:
+    # number of possible windows = len(features_df) - LOOKBACK - HORIZON
+    n_windows = len(features_df) - LOOKBACK - HORIZON
+    split_idx = int(n_windows * TRAIN_RATIO)
+    # Training windows use feature rows from index 0..split_idx+LOOKBACK-1
+    train_end = split_idx + LOOKBACK
+    train_features = features_df.iloc[:train_end].values.astype(np.float32)
 
     scaler = StandardScaler()
-    scaler.fit(X_train.reshape(-1, num_features))
-    print(f"  Scaler calibrated on {len(X_train):,} training windows.")
+    scaler.fit(train_features)
+    print(f"  Scaler calibrated on {len(train_features):,} feature rows "
+          f"(~{split_idx:,} training windows).")
     return scaler
 
 
